@@ -156,36 +156,22 @@ def resolve_shortcut(lnk_path):
         else:
             icon_path = icon_location.strip() or target
             icon_index = 0
+        # 展开 %SystemRoot% 之类的环境变量，否则 os.path.exists 会假失败
+        if target:
+            target = os.path.expandvars(target)
+        if icon_path:
+            icon_path = os.path.expandvars(icon_path)
         return target, icon_path, icon_index
     except Exception as e:
         print(f"[QuickDeck] resolve_shortcut error: {e}", file=sys.stderr)
         return "", "", 0
 
 
-def extract_icon_image(path, index=0, size=ICON_SIZE):
+def _hicon_to_pil(hicon, size=ICON_SIZE):
     """
-    从 exe / dll / ico 抽取图标并转为 PIL.Image。
-    使用 ExtractIconEx 拿到 HICON，DrawIconEx 缩放绘制到位图，再读位图字节。
-    失败返回 None，同时保证 GDI/图标句柄被释放。
+    把 HICON 绘制到 32bit 兼容位图并转成 PIL.Image (RGBA)。
+    调用后 **一定** 会 DestroyIcon(hicon)，失败返回 None。
     """
-    if not path or not os.path.exists(path):
-        return None
-    try:
-        large, small = win32gui.ExtractIconEx(path, index, 1)
-    except Exception:
-        return None
-
-    icons = list(large) + list(small)
-    if not icons:
-        return None
-    hicon = icons[0]
-    # 释放其余暂不用的图标句柄
-    for h in icons[1:]:
-        try:
-            win32gui.DestroyIcon(h)
-        except Exception:
-            pass
-
     hdc_handle = None
     hdc = None
     memdc = None
@@ -196,20 +182,21 @@ def extract_icon_image(path, index=0, size=ICON_SIZE):
         hbmp.CreateCompatibleBitmap(hdc, size, size)
         memdc = hdc.CreateCompatibleDC()
         old = memdc.SelectObject(hbmp)
-        # DrawIconEx 支持任意尺寸缩放绘制，比 DrawIcon 更灵活
+        # DrawIconEx 支持任意尺寸缩放绘制
         win32gui.DrawIconEx(
             memdc.GetSafeHdc(), 0, 0, hicon,
             size, size, 0, 0, win32con.DI_NORMAL
         )
         memdc.SelectObject(old)
-
         # 位图字节按 BGRA 排列，用 Pillow 读回 RGBA
         bmp_bits = hbmp.GetBitmapBits(True)
-        img = Image.frombuffer("RGBA", (size, size),
-                               bmp_bits, "raw", "BGRA", 0, 1)
+        img = Image.frombuffer(
+            "RGBA", (size, size),
+            bmp_bits, "raw", "BGRA", 0, 1
+        )
         return img
     except Exception as e:
-        print(f"[QuickDeck] extract_icon_image error: {e}", file=sys.stderr)
+        print(f"[QuickDeck] _hicon_to_pil error: {e}", file=sys.stderr)
         return None
     finally:
         # 严格顺序释放：memdc → hdc → GetDC 得到的句柄 → hicon
@@ -234,23 +221,345 @@ def extract_icon_image(path, index=0, size=ICON_SIZE):
             pass
 
 
+def extract_icon_image(path, index=0, size=ICON_SIZE):
+    """
+    ExtractIconEx 从 exe/dll/ico 抽取图标 → PIL.Image。
+    对普通 PE 文件效果最好；对 UWP、shell 命名空间、
+    某些自定义资源可能拿不到，此时应走 shget_icon_image 兜底。
+    """
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        large, small = win32gui.ExtractIconEx(path, index, 1)
+    except Exception:
+        return None
+    icons = list(large) + list(small)
+    if not icons:
+        return None
+    hicon = icons[0]
+    for h in icons[1:]:
+        try:
+            win32gui.DestroyIcon(h)
+        except Exception:
+            pass
+    return _hicon_to_pil(hicon, size)
+
+
+# ---- SHGetFileInfoW 兜底 ---------------------------------------
+# 通过 ctypes 直接调用 shell32，避免依赖 pywin32 的 shell 子模块
+_SHGFI_ICON = 0x00000100
+_SHGFI_LARGEICON = 0x00000000
+_SHGFI_USEFILEATTRIBUTES = 0x00000010
+
+
+class _SHFILEINFOW(ctypes.Structure):
+    _fields_ = [
+        ("hIcon", ctypes.c_void_p),
+        ("iIcon", ctypes.c_int),
+        ("dwAttributes", ctypes.c_ulong),
+        ("szDisplayName", ctypes.c_wchar * 260),
+        ("szTypeName", ctypes.c_wchar * 80),
+    ]
+
+
+def shget_icon_image(path, size=ICON_SIZE):
+    """
+    用 shell32.SHGetFileInfoW 取"Explorer 里显示的那张图标"，覆盖：
+      - UWP / AppX / shell 命名空间目标 (ExtractIconEx 拿不到)
+      - lnk 本身：Windows 会自动解析目标并叠加左下角小箭头
+      - 图标资源不在常规 icon table 里的 exe
+    失败返回 None。
+    """
+    if not path:
+        return None
+    try:
+        info = _SHFILEINFOW()
+        # 目标若不存在，加 SHGFI_USEFILEATTRIBUTES 让 shell 只按扩展名给通用图标；
+        # 存在则不加，能拿到"真图标"。
+        flags = _SHGFI_ICON | _SHGFI_LARGEICON
+        if not os.path.exists(path):
+            flags |= _SHGFI_USEFILEATTRIBUTES
+        ret = ctypes.windll.shell32.SHGetFileInfoW(
+            ctypes.c_wchar_p(path),
+            0,
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+            flags
+        )
+        if ret == 0 or not info.hIcon:
+            return None
+        return _hicon_to_pil(info.hIcon, size)
+    except Exception as e:
+        print(f"[QuickDeck] shget_icon_image error: {e}", file=sys.stderr)
+        return None
+
+
+# ---- IShellItemImageFactory 兜底 -------------------------------
+# Windows Vista+ 官方 API，Explorer 里显示大图标 / 缩略图用的路径。
+# 对 .NET 内嵌资源、UWP、以及 ExtractIconEx / SHGetFileInfoW 都拿不到
+# 或返回"通用图标"的场景效果最好。
+# 走 ctypes 手写 COM vtable 调用，避免依赖 pywin32 的 shell 子模块。
+
+class _GUID(ctypes.Structure):
+    _fields_ = [
+        ("Data1", ctypes.c_ulong),
+        ("Data2", ctypes.c_ushort),
+        ("Data3", ctypes.c_ushort),
+        ("Data4", ctypes.c_byte * 8),
+    ]
+
+
+def _iid(s):
+    g = _GUID()
+    ctypes.windll.ole32.CLSIDFromString(ctypes.c_wchar_p(s), ctypes.byref(g))
+    return g
+
+
+class _SIZE(ctypes.Structure):
+    _fields_ = [("cx", ctypes.c_long), ("cy", ctypes.c_long)]
+
+
+class _BITMAPINFOHEADER(ctypes.Structure):
+    _fields_ = [
+        ("biSize", ctypes.c_ulong),
+        ("biWidth", ctypes.c_long),
+        ("biHeight", ctypes.c_long),
+        ("biPlanes", ctypes.c_ushort),
+        ("biBitCount", ctypes.c_ushort),
+        ("biCompression", ctypes.c_ulong),
+        ("biSizeImage", ctypes.c_ulong),
+        ("biXPelsPerMeter", ctypes.c_long),
+        ("biYPelsPerMeter", ctypes.c_long),
+        ("biClrUsed", ctypes.c_ulong),
+        ("biClrImportant", ctypes.c_ulong),
+    ]
+
+
+class _BITMAPINFO(ctypes.Structure):
+    _fields_ = [
+        ("bmiHeader", _BITMAPINFOHEADER),
+        ("bmiColors", ctypes.c_ulong * 3),
+    ]
+
+
+class _BITMAP(ctypes.Structure):
+    _fields_ = [
+        ("bmType", ctypes.c_long),
+        ("bmWidth", ctypes.c_long),
+        ("bmHeight", ctypes.c_long),
+        ("bmWidthBytes", ctypes.c_long),
+        ("bmPlanes", ctypes.c_ushort),
+        ("bmBitsPixel", ctypes.c_ushort),
+        ("bmBits", ctypes.c_void_p),
+    ]
+
+
+_IID_IShellItem_STR = "{43826D1E-E718-42EE-BC55-A1E261C37BFE}"
+_IID_IShellItemImageFactory_STR = "{BCC18B79-BA16-442F-80C4-8A59C30C463B}"
+
+# IShellItemImageFactory::GetImage 的 SIIGBF 标志
+_SIIGBF_BIGGERSIZEOK = 0x00000001  # 允许返回比请求更大的图标（再让我们缩）
+_SIIGBF_ICONONLY = 0x00000004      # 只要图标，不要缩略图
+
+_COM_INITED = False
+
+
+def _ensure_com():
+    global _COM_INITED
+    if not _COM_INITED:
+        try:
+            # 0x2 = COINIT_APARTMENTTHREADED，tk 主线程用 STA
+            ctypes.windll.ole32.CoInitializeEx(None, 0x2)
+        except Exception:
+            pass
+        _COM_INITED = True
+
+
+def _com_release(obj_ptr):
+    """调用 IUnknown::Release (vtable[2])。"""
+    if not obj_ptr:
+        return
+    try:
+        vtbl = ctypes.cast(obj_ptr,
+                           ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))[0]
+        rel_ft = ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)
+        ctypes.cast(vtbl[2], rel_ft)(obj_ptr)
+    except Exception:
+        pass
+
+
+def _hbitmap_to_pil(hbmp, size):
+    """把 HBITMAP 转成 PIL.Image。调用方负责 DeleteObject(hbmp)。"""
+    bm = _BITMAP()
+    if ctypes.windll.gdi32.GetObjectW(hbmp, ctypes.sizeof(bm),
+                                      ctypes.byref(bm)) == 0:
+        return None
+    w, h = int(bm.bmWidth), int(bm.bmHeight)
+    if w <= 0 or h <= 0:
+        return None
+
+    bi = _BITMAPINFO()
+    bi.bmiHeader.biSize = ctypes.sizeof(_BITMAPINFOHEADER)
+    bi.bmiHeader.biWidth = w
+    bi.bmiHeader.biHeight = -h  # 顶到底，与 PIL 一致
+    bi.bmiHeader.biPlanes = 1
+    bi.bmiHeader.biBitCount = 32
+    bi.bmiHeader.biCompression = 0  # BI_RGB
+
+    buf = (ctypes.c_ubyte * (w * h * 4))()
+    hdc = ctypes.windll.user32.GetDC(0)
+    try:
+        got = ctypes.windll.gdi32.GetDIBits(
+            hdc, hbmp, 0, h,
+            ctypes.byref(buf), ctypes.byref(bi), 0  # DIB_RGB_COLORS
+        )
+        if got == 0:
+            return None
+    finally:
+        ctypes.windll.user32.ReleaseDC(0, hdc)
+
+    img = Image.frombuffer("RGBA", (w, h), bytes(buf), "raw", "BGRA", 0, 1)
+    if (w, h) != (size, size):
+        img = img.resize((size, size), Image.LANCZOS)
+    return img
+
+
+def imagefactory_icon(path, size=ICON_SIZE):
+    """
+    通过 IShellItemImageFactory::GetImage 拿图标。
+    对 .NET 内嵌资源 / UWP / 其他 API 拿不到的场景效果最好。
+    请求 2x 尺寸 + BIGGERSIZEOK，能拿到更清晰的 jumbo 版本再缩放。
+    """
+    if not path:
+        return None
+    _ensure_com()
+
+    item_ptr = ctypes.c_void_p()
+    factory_ptr = ctypes.c_void_p()
+    hbmp = ctypes.c_void_p()
+    try:
+        iid_item = _iid(_IID_IShellItem_STR)
+        iid_factory = _iid(_IID_IShellItemImageFactory_STR)
+
+        # HRESULT SHCreateItemFromParsingName(pszPath, pbc, riid, ppv)
+        hr = ctypes.windll.shell32.SHCreateItemFromParsingName(
+            ctypes.c_wchar_p(path), None,
+            ctypes.byref(iid_item), ctypes.byref(item_ptr)
+        )
+        if hr != 0 or not item_ptr.value:
+            return None
+
+        # item->QueryInterface(IID_IShellItemImageFactory, &factory)
+        vtbl_item = ctypes.cast(
+            item_ptr, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))
+        )[0]
+        qi_ft = ctypes.WINFUNCTYPE(
+            ctypes.HRESULT, ctypes.c_void_p,
+            ctypes.POINTER(_GUID), ctypes.POINTER(ctypes.c_void_p)
+        )
+        hr = ctypes.cast(vtbl_item[0], qi_ft)(
+            item_ptr, ctypes.byref(iid_factory), ctypes.byref(factory_ptr)
+        )
+        if hr != 0 or not factory_ptr.value:
+            return None
+
+        # factory->GetImage((cx, cy), flags, &hbmp)  (vtable[3])
+        sz = _SIZE(size * 2, size * 2)
+        vtbl_fac = ctypes.cast(
+            factory_ptr, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))
+        )[0]
+        gi_ft = ctypes.WINFUNCTYPE(
+            ctypes.HRESULT, ctypes.c_void_p,
+            _SIZE, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p)
+        )
+        hr = ctypes.cast(vtbl_fac[3], gi_ft)(
+            factory_ptr, sz,
+            _SIIGBF_BIGGERSIZEOK | _SIIGBF_ICONONLY,
+            ctypes.byref(hbmp)
+        )
+        if hr != 0 or not hbmp.value:
+            return None
+
+        return _hbitmap_to_pil(hbmp.value, size)
+    except Exception as e:
+        print(f"[QuickDeck] imagefactory_icon error: {e}", file=sys.stderr)
+        return None
+    finally:
+        if hbmp and hbmp.value:
+            try:
+                ctypes.windll.gdi32.DeleteObject(hbmp)
+            except Exception:
+                pass
+        _com_release(factory_ptr)
+        _com_release(item_ptr)
+
+
 def get_icon_for_file(path, size=ICON_SIZE):
-    """根据后缀选择最佳提取路径；失败返回 None。"""
+    """
+    多层兜底图标提取：
+      .lnk:
+        1) IconLocation 指定的图标（若有）
+        2) TargetPath 的 ExtractIconEx
+        3) IShellItemImageFactory 对 lnk 本身  ← 对 .NET / 特殊资源最强
+        4) IShellItemImageFactory 对 TargetPath
+        5) SHGetFileInfoW 对 lnk 本身
+        6) SHGetFileInfoW 对 TargetPath
+      其他文件:
+        1) ExtractIconEx
+        2) IShellItemImageFactory
+        3) SHGetFileInfoW
+    """
     if not HAS_WIN32:
         return None
     ext = os.path.splitext(path)[1].lower()
+    tried = set()
+
     if ext == ".lnk":
-        _, icon_path, icon_index = resolve_shortcut(path)
+        target, icon_path, icon_index = resolve_shortcut(path)
+
         if icon_path:
-            img = extract_icon_image(icon_path, icon_index, size)
+            key = (icon_path.lower(), icon_index)
+            if key not in tried:
+                tried.add(key)
+                img = extract_icon_image(icon_path, icon_index, size)
+                if img is not None:
+                    return img
+
+        if target:
+            key = (target.lower(), 0)
+            if key not in tried:
+                tried.add(key)
+                img = extract_icon_image(target, 0, size)
+                if img is not None:
+                    return img
+
+        # IShellItemImageFactory 对 lnk 本身
+        img = imagefactory_icon(path, size)
+        if img is not None:
+            return img
+
+        if target:
+            img = imagefactory_icon(target, size)
             if img is not None:
                 return img
-        # 兜底：从 lnk 自身尝试
+
+        # 最后 SHGetFileInfoW 兜底
+        img = shget_icon_image(path, size)
+        if img is not None:
+            return img
+
+        if target:
+            img = shget_icon_image(target, size)
+            if img is not None:
+                return img
+    else:
         img = extract_icon_image(path, 0, size)
         if img is not None:
             return img
-    else:
-        img = extract_icon_image(path, 0, size)
+        img = imagefactory_icon(path, size)
+        if img is not None:
+            return img
+        img = shget_icon_image(path, size)
         if img is not None:
             return img
     return None
@@ -333,12 +642,14 @@ class ShortcutCard(tk.Frame):
                                  command=self._on_delete)
         self.del_btn.pack(side="right", padx=(8, 0))
 
-        # ---- 拖拽绑定 -----------------------------------------
+        # ---- 拖拽 & 双击绑定 -----------------------------------
         # 仅绑到非交互控件上，避免影响 Entry 选择与删除按钮点击
         for w in (self, mid, self.icon_label, self.title_label):
             w.bind("<ButtonPress-1>", self._on_drag_start)
             w.bind("<B1-Motion>", self._on_drag_motion)
             w.bind("<ButtonRelease-1>", self._on_drag_end)
+            # 双击卡片区域 = 启动对应程序
+            w.bind("<Double-Button-1>", self._on_double_click)
 
     # ---- 事件回调 ---------------------------------------------
     def _on_delete(self):
@@ -352,6 +663,9 @@ class ShortcutCard(tk.Frame):
 
     def _on_drag_end(self, e):
         self.app.drag_end(self, e)
+
+    def _on_double_click(self, e):
+        self.app.launch_card(self)
 
 
 # ================================================================
@@ -585,14 +899,47 @@ class App(tk.Tk):
         if paths:
             self.save_state()
 
+    @staticmethod
+    def _normalize_path(p):
+        """规范化路径用于去重（大小写不敏感 + 展开环境变量 + 绝对路径）。"""
+        if not p:
+            return ""
+        try:
+            return os.path.normcase(os.path.abspath(os.path.expandvars(p)))
+        except Exception:
+            return p
+
+    def _has_card_with_path(self, path):
+        norm = self._normalize_path(path)
+        return any(self._normalize_path(c.path) == norm for c in self.cards)
+
     def _add_card(self, path, description):
+        """添加卡片；若路径已存在则安静跳过，返回是否真的添加了。"""
+        if self._has_card_with_path(path):
+            return False
         try:
             card = ShortcutCard(self.inner_frame, self, path, description)
         except Exception as e:
             print(f"[QuickDeck] add_card error: {e}", file=sys.stderr)
-            return
+            return False
         card.pack(fill="x", pady=3, padx=2)
         self.cards.append(card)
+        return True
+
+    def launch_card(self, card):
+        """双击卡片时启动对应的快捷方式/程序。"""
+        path = card.path
+        try:
+            if not os.path.exists(path):
+                messagebox.showwarning(
+                    "启动失败", f"文件不存在:\n{path}"
+                )
+                return
+            # os.startfile 在 Windows 上等价于双击资源管理器：
+            # .lnk 会被解析并启动、.exe 会直接运行
+            os.startfile(path)
+        except Exception as e:
+            messagebox.showerror("启动失败", f"{path}\n\n{e}")
 
     def _load_shortcuts_from_config(self):
         items = self.cfg.get("shortcuts", [])
