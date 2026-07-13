@@ -897,19 +897,52 @@ class ShortcutCard(tk.Frame):
             w.bind("<Double-Button-1>", self._on_double_click)
 
     def _on_delete(self):
+        # 所属文件夹上锁时禁止删除
+        if self.folder is not None and getattr(self.folder, "locked", False):
+            return
         self.app.remove_card(self)
 
     def _on_drag_start(self, e):
+        if self.folder is not None and getattr(self.folder, "locked", False):
+            return
         self.app.card_drag_start(self, e)
 
     def _on_drag_motion(self, e):
+        if self.folder is not None and getattr(self.folder, "locked", False):
+            return
         self.app.card_drag_motion(self, e)
 
     def _on_drag_end(self, e):
+        if self.folder is not None and getattr(self.folder, "locked", False):
+            return
         self.app.card_drag_end(self, e)
 
     def _on_double_click(self, e):
+        # 上锁时唯一保留的行为：双击启动
         self.app.launch_card(self)
+
+    # ---- 锁定状态可视化 ----
+    def apply_lock_state(self, locked):
+        """描述框改为只读、删除按钮禁用；双击/拖拽通过绑定内 flag 已拦截。"""
+        state = "disabled" if locked else "normal"
+        try:
+            # Entry 用 readonly 可以保留内容可见，disabled 会变灰但也可
+            self.desc_entry.configure(
+                state="readonly" if locked else "normal"
+            )
+        except Exception:
+            pass
+        try:
+            self.del_btn.configure(state=state)
+        except Exception:
+            pass
+        # 光标反馈：拖拽把手/图标/标题不再显示 fleur 移动光标
+        cursor = "arrow" if locked else "fleur"
+        for w in (self, self.icon_label, self.title_label):
+            try:
+                w.configure(cursor=cursor)
+            except Exception:
+                pass
 
 
 # ================================================================
@@ -934,6 +967,7 @@ class FolderFrame(tk.Frame):
         self.name = name
         self.cards = []
         self._num_cols = 1
+        self.locked = False  # 上锁时禁用名字编辑 / 卡片编辑 / 卡片拖拽 / 删除
 
         # ---- header（紧凑：小 padding，无冗余空间） ----
         header = tk.Frame(self, bg="#E0E0E0", padx=4, pady=1)
@@ -961,6 +995,17 @@ class FolderFrame(tk.Frame):
         self.name_entry.pack(side="left", fill="x", expand=True, padx=(2, 4))
         self.name_entry.bind("<FocusOut>", lambda e: self._on_rename())
         self.name_entry.bind("<Return>", lambda e: self._on_rename())
+
+        # 上锁按钮：🔓/🔒 切换；点击调 toggle_lock
+        self.lock_btn = tk.Button(
+            header, text="\U0001F513",  # 🔓
+            font=self._header_font, relief="flat", bd=0,
+            bg="#E0E0E0", fg="#333333",
+            activebackground="#D0D0D0",
+            padx=4, pady=0,
+            command=self._on_toggle_lock
+        )
+        self.lock_btn.pack(side="right", padx=(0, 2))
 
         # 用小号 ✕ 按钮替代原来的"删除文件夹"文本按钮，
         # 让 header 高度显著变矮；保留同样的悬停危险色反馈
@@ -997,6 +1042,11 @@ class FolderFrame(tk.Frame):
 
     # ---- 事件 ----
     def _on_rename(self):
+        # 锁定时 name_entry 已是 disabled，正常不会走到这；作双保险
+        if self.locked:
+            if self.name_var.get() != self.name:
+                self.name_var.set(self.name)
+            return
         new_name = self.name_var.get().strip()
         if not new_name:
             self.name_var.set(self.name)
@@ -1006,9 +1056,46 @@ class FolderFrame(tk.Frame):
             self.app.save_state()
 
     def _on_delete(self):
+        if self.locked:
+            return
         self.app.delete_folder(self)
 
+    def _on_toggle_lock(self):
+        self.set_locked(not self.locked)
+        self.app.save_state()
+
+    def set_locked(self, locked):
+        """切换本 folder 的锁定态，并把状态传播到 header + 所有卡片。"""
+        self.locked = bool(locked)
+        # header 视觉：图标切换 + name_entry 禁用/启用 + 删除按钮禁用/启用
+        try:
+            self.lock_btn.configure(
+                text="\U0001F512" if self.locked else "\U0001F513"  # 🔒 / 🔓
+            )
+        except Exception:
+            pass
+        try:
+            # 用 readonly 保留文字可见与选取，但不允许键入
+            self.name_entry.configure(
+                state="readonly" if self.locked else "normal"
+            )
+        except Exception:
+            pass
+        try:
+            self.del_btn.configure(
+                state="disabled" if self.locked else "normal"
+            )
+        except Exception:
+            pass
+        # 传播到所有卡片
+        for c in self.cards:
+            try:
+                c.apply_lock_state(self.locked)
+            except Exception:
+                pass
+
     def _on_folder_drag_start(self, e):
+        # 文件夹之间仍可拖动（不受 lock 影响）
         self.app.folder_drag_start(self, e)
 
     def _on_folder_drag_motion(self, e):
@@ -1030,12 +1117,20 @@ class FolderFrame(tk.Frame):
     def add_card(self, card):
         self.cards.append(card)
         card.folder = self
+        try:
+            card.apply_lock_state(self.locked)
+        except Exception:
+            pass
         self._reflow()
 
     def insert_card(self, card, pos):
         pos = max(0, min(pos, len(self.cards)))
         self.cards.insert(pos, card)
         card.folder = self
+        try:
+            card.apply_lock_state(self.locked)
+        except Exception:
+            pass
         self._reflow()
 
     def remove_card(self, card):
@@ -1412,6 +1507,11 @@ class App(tk.Tk):
             for c in moved:
                 target.cards.append(c)
                 c.folder = target
+                # 让迁入卡片继承目标 folder 的锁定态
+                try:
+                    c.apply_lock_state(getattr(target, "locked", False))
+                except Exception:
+                    pass
             target._reflow()
         self.folders.remove(folder)
         try:
@@ -1476,6 +1576,9 @@ class App(tk.Tk):
 
     def remove_card(self, card):
         folder = card.folder
+        # folder 上锁时，任何路径的删除都失效（含未来可能的键盘快捷键等）
+        if folder is not None and getattr(folder, "locked", False):
+            return
         if folder is not None:
             folder.remove_card(card)
         try:
@@ -1506,10 +1609,16 @@ class App(tk.Tk):
                         "name": "默认", "order": 0}]
         folders = sorted(folders, key=lambda x: x.get("order", 0))
         for fd in folders:
-            self._create_folder(
+            f = self._create_folder(
                 fd.get("id") or ("f_" + uuid.uuid4().hex[:8]),
                 fd.get("name") or "未命名"
             )
+            # 恢复锁定态；卡片会在稍后 add_card 时通过 folder.locked 传播
+            if fd.get("locked"):
+                try:
+                    f.set_locked(True)
+                except Exception:
+                    pass
 
         items = self.cfg.get("shortcuts") or []
         items = sorted(
@@ -1822,7 +1931,8 @@ class App(tk.Tk):
         }
         self.cfg["card_width"] = int(self.card_width)
         self.cfg["folders"] = [
-            {"id": f.id, "name": f.name, "order": i}
+            {"id": f.id, "name": f.name, "order": i,
+             "locked": bool(getattr(f, "locked", False))}
             for i, f in enumerate(self.folders)
         ]
         shortcuts = []
