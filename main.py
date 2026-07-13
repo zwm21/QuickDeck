@@ -66,6 +66,7 @@ ICON_SIZE = 32  # 卡片上显示的图标像素尺寸
 DEFAULT_CONFIG = {
     "window": {"width": 900, "height": 650, "x": 200, "y": 100},
     "font": {"family": BUILTIN_FONT_FAMILY, "size": 12},
+    "card_width": 500,
     "shortcuts": []
 }
 
@@ -837,10 +838,11 @@ def make_default_icon(size=ICON_SIZE):
 # 快捷方式卡片
 # ================================================================
 class ShortcutCard(tk.Frame):
-    """一张快捷方式卡片，宽度固定 500px。
+    """一张快捷方式卡片，宽度由 App.card_width 动态决定（默认 500px）。
     可拖拽（换顺序 / 跨文件夹）、可双击启动。
     """
 
+    # 兼容旧引用；实际生效值走 App.card_width（可由 UI 实时调整）
     CARD_WIDTH = 500
 
     def __init__(self, master, app, path, description=""):
@@ -920,7 +922,10 @@ class FolderFrame(tk.Frame):
     这样跨文件夹移动卡片时不用销毁 / 重建，也就不用重新提取图标。
     """
 
-    _CARD_UNIT = ShortcutCard.CARD_WIDTH + 10  # 500 卡片宽 + 每列 padding 余量
+    # 每列宽度单位：卡片宽度 + 一点 padding 余量；从 app.card_width 动态取
+    @property
+    def _CARD_UNIT(self):
+        return int(self.app.card_width) + 10
 
     def __init__(self, master, app, folder_id, name):
         super().__init__(master, bd=1, relief="solid", bg="#F5F5F5")
@@ -930,38 +935,47 @@ class FolderFrame(tk.Frame):
         self.cards = []
         self._num_cols = 1
 
-        # ---- header ----
-        header = tk.Frame(self, bg="#E0E0E0", padx=6, pady=4)
+        # ---- header（紧凑：小 padding，无冗余空间） ----
+        header = tk.Frame(self, bg="#E0E0E0", padx=4, pady=1)
         header.pack(fill="x")
         self.header = header
 
+        # 用小号字（约为 app 字体的 0.9 倍）让 header 更矮
+        self._header_font = tkFont.Font(
+            family=app.app_font.cget("family"),
+            size=max(8, int(app.app_font.cget("size")) - 1)
+        )
+
         self.drag_handle = tk.Label(
-            header, text="\u2630", font=app.app_font,  # ☰
-            bg="#E0E0E0", cursor="fleur", padx=6
+            header, text="\u2630", font=self._header_font,  # ☰
+            bg="#E0E0E0", cursor="fleur", padx=2
         )
         self.drag_handle.pack(side="left")
 
         self.name_var = tk.StringVar(value=name)
         self.name_entry = tk.Entry(
             header, textvariable=self.name_var,
-            font=app.app_font, bd=0, bg="#E0E0E0",
+            font=self._header_font, bd=0, bg="#E0E0E0",
             highlightthickness=0
         )
-        self.name_entry.pack(side="left", fill="x", expand=True, padx=(4, 8))
+        self.name_entry.pack(side="left", fill="x", expand=True, padx=(2, 4))
         self.name_entry.bind("<FocusOut>", lambda e: self._on_rename())
         self.name_entry.bind("<Return>", lambda e: self._on_rename())
 
+        # 用小号 ✕ 按钮替代原来的"删除文件夹"文本按钮，
+        # 让 header 高度显著变矮；保留同样的悬停危险色反馈
         self.del_btn = tk.Button(
-            header, text="删除文件夹",
-            font=app.app_font, relief="flat",
+            header, text="\u2716",  # ✖
+            font=self._header_font, relief="flat", bd=0,
             bg="#E0E0E0", fg="#B22222",
             activebackground="#FADBD8",
+            padx=4, pady=0,
             command=self._on_delete
         )
         self.del_btn.pack(side="right")
 
-        # ---- body（卡片 grid 容器） ----
-        self.body = tk.Frame(self, bg="#F5F5F5", padx=6, pady=6)
+        # ---- body（卡片 grid 容器；padding 也收紧） ----
+        self.body = tk.Frame(self, bg="#F5F5F5", padx=4, pady=3)
         self.body.pack(fill="both", expand=True)
         self.body.bind("<Configure>", self._on_body_configure)
 
@@ -970,6 +984,16 @@ class FolderFrame(tk.Frame):
             w.bind("<ButtonPress-1>", self._on_folder_drag_start)
             w.bind("<B1-Motion>", self._on_folder_drag_motion)
             w.bind("<ButtonRelease-1>", self._on_folder_drag_end)
+
+    def refresh_header_font(self):
+        """app 字体变化时，让 header 内部小号字跟着刷新。"""
+        try:
+            self._header_font.configure(
+                family=self.app.app_font.cget("family"),
+                size=max(8, int(self.app.app_font.cget("size")) - 1)
+            )
+        except Exception:
+            pass
 
     # ---- 事件 ----
     def _on_rename(self):
@@ -1057,7 +1081,7 @@ class FolderFrame(tk.Frame):
                 c.pack_forget()
             except Exception:
                 pass
-        cw = ShortcutCard.CARD_WIDTH
+        cw = int(self.app.card_width)
         for col in range(self._num_cols):
             self.body.grid_columnconfigure(col, minsize=cw, weight=0)
         # 收敛：清掉多余列的最小宽度配置
@@ -1116,6 +1140,12 @@ class App(tk.Tk):
             family=self.cfg["font"].get("family", BUILTIN_FONT_FAMILY),
             size=int(self.cfg["font"].get("size", 12))
         )
+        # 卡片宽度（运行时可调，实时影响所有 folder 的 grid 列宽）
+        try:
+            self.card_width = int(self.cfg.get("card_width", 500))
+        except (TypeError, ValueError):
+            self.card_width = 500
+        self.card_width = max(200, min(1200, self.card_width))
 
         self.style = ttk.Style(self)
         try:
@@ -1207,6 +1237,51 @@ class App(tk.Tk):
         self.font_size_spin.pack(side="left", padx=4)
         self.font_size_spin.bind("<KeyRelease>", self._on_font_change)
         self.font_size_spin.bind("<FocusOut>", self._on_font_change)
+
+        # 卡片宽度调节
+        tk.Label(font_card, text="卡片宽度：",
+                 font=self.app_font, bg="#F8F9FA"
+                 ).pack(side="left", padx=(12, 0))
+        self.card_width_var = tk.StringVar(value=str(int(self.card_width)))
+        # tk.Spinbox 的箭头默认只在按下瞬间触发一次，长按不连续；
+        # 这里保留 Spinbox 作为可键盘输入/单击的入口，但另外把两个自定义
+        # 小箭头贴在旁边，用 ButtonPress/ButtonRelease + after 实现按住连续变化
+        self.card_width_spin = tk.Spinbox(
+            font_card, from_=200, to=1200, width=6,
+            textvariable=self.card_width_var,
+            font=self.app_font, command=self._on_card_width_change,
+            increment=1
+        )
+        self.card_width_spin.pack(side="left", padx=(4, 0))
+        self.card_width_spin.bind("<KeyRelease>",
+                                  self._on_card_width_change)
+        self.card_width_spin.bind("<FocusOut>",
+                                  self._on_card_width_change)
+        # 状态：长按定时器 + 当前方向
+        self._cw_repeat_after = None
+        self._cw_repeat_dir = 0
+        arrow_up = tk.Button(
+            font_card, text="\u25B2",  # ▲
+            font=self._make_small_font(), relief="flat", bd=1,
+            padx=2, pady=0, width=2, takefocus=0
+        )
+        arrow_up.pack(side="left", padx=(2, 0))
+        arrow_dn = tk.Button(
+            font_card, text="\u25BC",  # ▼
+            font=self._make_small_font(), relief="flat", bd=1,
+            padx=2, pady=0, width=2, takefocus=0
+        )
+        arrow_dn.pack(side="left", padx=(2, 0))
+        arrow_up.bind("<ButtonPress-1>",
+                      lambda e: self._cw_repeat_begin(+1))
+        arrow_up.bind("<ButtonRelease-1>",
+                      lambda e: self._cw_repeat_end())
+        arrow_dn.bind("<ButtonPress-1>",
+                      lambda e: self._cw_repeat_begin(-1))
+        arrow_dn.bind("<ButtonRelease-1>",
+                      lambda e: self._cw_repeat_end())
+        self.card_width_arrow_up = arrow_up
+        self.card_width_arrow_dn = arrow_dn
 
         # 工具栏
         toolbar = tk.Frame(bottom)
@@ -1476,7 +1551,78 @@ class App(tk.Tk):
             return
         self.app_font.configure(family=family, size=size)
         self._apply_style_font()
+        # 字体变化时同步刷新 folder header 用的小号字
+        for f in self.folders:
+            try:
+                f.refresh_header_font()
+            except Exception:
+                pass
         self.save_state()
+
+    # ---- 卡片宽度 ----
+    def _make_small_font(self):
+        """给宽度调节小箭头按钮用的固定小号字。"""
+        return tkFont.Font(family="Segoe UI", size=8)
+
+    def _on_card_width_change(self, event=None):
+        try:
+            v = int(self.card_width_var.get())
+        except (ValueError, tk.TclError):
+            return
+        v = max(200, min(1200, v))
+        if v == self.card_width_var_int_last():
+            return
+        self._apply_card_width(v)
+
+    def card_width_var_int_last(self):
+        return int(self.card_width)
+
+    def _apply_card_width(self, v):
+        v = max(200, min(1200, int(v)))
+        if v == self.card_width:
+            return
+        self.card_width = v
+        # 回写 spinbox 显示（避免键盘越界后 UI 不同步）
+        if self.card_width_var.get() != str(v):
+            self.card_width_var.set(str(v))
+        # 让所有已有卡片按新宽度重新排布
+        for folder in self.folders:
+            try:
+                folder._reflow()
+            except Exception:
+                pass
+        # 防抖保存
+        if self._save_timer is not None:
+            try:
+                self.after_cancel(self._save_timer)
+            except Exception:
+                pass
+        self._save_timer = self.after(500, self.save_state)
+
+    def _cw_repeat_begin(self, direction):
+        """按下自定义 ▲/▼ 按钮时开始连续 +1/-1。"""
+        self._cw_repeat_dir = direction
+        self._cw_repeat_step(first=True)
+
+    def _cw_repeat_step(self, first=False):
+        if self._cw_repeat_dir == 0:
+            return
+        new_v = self.card_width + self._cw_repeat_dir
+        new_v = max(200, min(1200, new_v))
+        if new_v != self.card_width:
+            self._apply_card_width(new_v)
+        # 第一次点击后 300ms 才开始连续，之后每 40ms 一步——手感接近系统 Spinbox
+        delay = 300 if first else 40
+        self._cw_repeat_after = self.after(delay, self._cw_repeat_step)
+
+    def _cw_repeat_end(self):
+        self._cw_repeat_dir = 0
+        if self._cw_repeat_after is not None:
+            try:
+                self.after_cancel(self._cw_repeat_after)
+            except Exception:
+                pass
+            self._cw_repeat_after = None
 
     # ============================================================
     # 窗口尺寸变化
@@ -1674,6 +1820,7 @@ class App(tk.Tk):
             "family": self.app_font.cget("family"),
             "size": int(self.app_font.cget("size"))
         }
+        self.cfg["card_width"] = int(self.card_width)
         self.cfg["folders"] = [
             {"id": f.id, "name": f.name, "order": i}
             for i, f in enumerate(self.folders)
