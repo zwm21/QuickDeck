@@ -1531,7 +1531,9 @@ class App(tk.Tk):
                        ("所有文件", "*.*")]
         )
         if path:
-            self._add_card(path, "")
+            # 添加到最后一个文件夹的末尾（用户手动新增时的默认落点）
+            target = self.folders[-1] if self.folders else None
+            self._add_card(path, "", folder=target)
             self.save_state()
 
     def _on_multi_add(self):
@@ -1540,8 +1542,9 @@ class App(tk.Tk):
             filetypes=[("快捷方式 / 程序", "*.lnk;*.exe"),
                        ("所有文件", "*.*")]
         )
+        target = self.folders[-1] if self.folders else None
         for p in paths:
-            self._add_card(p, "")
+            self._add_card(p, "", folder=target)
         if paths:
             self.save_state()
 
@@ -1559,13 +1562,13 @@ class App(tk.Tk):
         return any(self._normalize_path(c.path) == norm for c in self.all_cards)
 
     def _add_card(self, path, description, folder=None):
-        """添加卡片；重复路径安静跳过。默认加到第一个文件夹的末尾。"""
+        """添加卡片；重复路径安静跳过。默认加到最后一个文件夹的末尾。"""
         if self._has_card_with_path(path):
             return False
         if folder is None:
             if not self.folders:
                 self._create_folder(self.DEFAULT_FOLDER_ID, "默认")
-            folder = self.folders[0]
+            folder = self.folders[-1]
         try:
             card = ShortcutCard(self.inner_frame, self, path, description)
         except Exception as e:
