@@ -1029,6 +1029,20 @@ class FolderFrame(tk.Frame):
         except Exception:
             pass
         actual_w = self.body.winfo_width()
+        # body 刚 pack 完还未完成 fill 扩展时 winfo_width=1，
+        # 逐级向上兜底：folder 自身宽度 → 上层 inner_frame 宽度。
+        # 减去 body 的 padx=6 左右两侧共 12px。
+        if actual_w <= 1:
+            fw = self.winfo_width()
+            if fw > 12:
+                actual_w = fw - 12
+        if actual_w <= 1:
+            try:
+                mw = self.master.winfo_width()
+                if mw > 24:
+                    actual_w = mw - 24
+            except Exception:
+                pass
         if actual_w > 1:
             self._num_cols = self._compute_num_cols(actual_w)
 
@@ -1053,6 +1067,17 @@ class FolderFrame(tk.Frame):
             r, col = i // self._num_cols, i % self._num_cols
             c.grid(row=r, column=col, in_=self.body,
                    padx=4, pady=4, sticky="ew")
+            # tkinter 的 -in 参数只改显示位置，不改 stacking order。
+            # card 的 tk parent 是 App.inner_frame，folder 也是。stacking
+            # 顺序按创建时间：老 folder < 老 card < 新 folder < ...。
+            # 如果 card 显示位置落在比它更"上层"的 folder.body 里，
+            # 后绘制的 folder.body 会用自己的背景色覆盖 card → 卡片消失。
+            # 每次 grid 后 tkraise 一下，把 card 顶到 inner_frame 最上层，
+            # 保证任何后来创建的 folder.body 都画在它下面。
+            try:
+                c.tkraise()
+            except Exception:
+                pass
         # 强制立即完成布局
         try:
             self.update_idletasks()
@@ -1274,10 +1299,21 @@ class App(tk.Tk):
         f = FolderFrame(self.inner_frame, self, folder_id, name)
         f.pack(fill="x", padx=6, pady=(6, 0))
         self.folders.append(f)
-        # 立即完成布局，让 body 拿到真实宽度；否则下一步若立刻往空文件夹里
-        # 拖卡片，会因为 body.winfo_width() 还没有值而导致卡片显示不出。
+        # 双重防御 stacking 陷阱：新 folder 默认在 inner_frame 里 stacking
+        # 最上层，如果之后拖入的 card 是"更早创建"的，card 显示位置在 folder.body
+        # 内但被 folder.body 的背景覆盖。让新 folder 沉底，配合 _reflow 里
+        # 对 card tkraise，保证 card 永远画在 folder 之上。
         try:
-            self.inner_frame.update_idletasks()
+            f.lower()
+        except Exception:
+            pass
+        # 立即完成整轮布局（不只 idletasks），让新 folder 的 body 通过
+        # pack fill 拿到真实宽度。否则用户马上把卡片拖进这个空文件夹时，
+        # body.winfo_width() 仍是初始 1，_reflow 里 num_cols=1 且列 minsize=500
+        # 会让 sticky="ew" 的卡片被 grid 到宽度不足的位置暂时不可见，
+        # 需要等下次几何刷新才显示。
+        try:
+            self.update()
         except Exception:
             pass
         return f
@@ -1560,6 +1596,15 @@ class App(tk.Tk):
                 src_folder.cards.remove(card)
                 src_folder._reflow()
             target_folder.insert_card(card, target_pos)
+            # 跨 folder 的首张卡片场景：target.body 可能刚 pack 完还没
+            # 完成 fill 扩展。这里让 target 及其 body 完整走一次几何刷新，
+            # 拿到真实宽度后再跑一次 _reflow，卡片就会立刻可见。
+            try:
+                target_folder.body.update_idletasks()
+                target_folder.update_idletasks()
+                target_folder._reflow()
+            except Exception:
+                pass
         # 全局强制刷新一次，确保新宿主的 grid 立即完成布局
         try:
             self.update_idletasks()
