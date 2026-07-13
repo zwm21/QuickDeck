@@ -280,11 +280,49 @@ def _init_win_apis():
         gdi32.DeleteObject.argtypes = [ctypes.c_void_p]
         gdi32.DeleteObject.restype = ctypes.c_int
 
+        gdi32.CreateCompatibleDC.argtypes = [ctypes.c_void_p]
+        gdi32.CreateCompatibleDC.restype = ctypes.c_void_p
+
+        gdi32.CreateDIBSection.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint,
+            ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_ulong
+        ]
+        gdi32.CreateDIBSection.restype = ctypes.c_void_p
+
+        gdi32.SelectObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        gdi32.SelectObject.restype = ctypes.c_void_p
+
+        gdi32.DeleteDC.argtypes = [ctypes.c_void_p]
+        gdi32.DeleteDC.restype = ctypes.c_int
+
+        gdi32.GdiFlush.argtypes = []
+        gdi32.GdiFlush.restype = ctypes.c_int
+
         user32.GetDC.argtypes = [ctypes.c_void_p]
         user32.GetDC.restype = ctypes.c_void_p
 
         user32.ReleaseDC.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
         user32.ReleaseDC.restype = ctypes.c_int
+
+        user32.DrawIconEx.argtypes = [
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_uint,
+            ctypes.c_void_p, ctypes.c_uint
+        ]
+        user32.DrawIconEx.restype = ctypes.c_int
+
+        user32.DestroyIcon.argtypes = [ctypes.c_void_p]
+        user32.DestroyIcon.restype = ctypes.c_int
+
+        # PrivateExtractIconsW：更宽容的图标提取（可指定尺寸，处理更多格式）
+        user32.PrivateExtractIconsW.argtypes = [
+            ctypes.c_wchar_p, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int,
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(ctypes.c_uint),
+            ctypes.c_uint, ctypes.c_uint
+        ]
+        user32.PrivateExtractIconsW.restype = ctypes.c_uint
 
         _APIS_INITED = True
     except Exception as e:
@@ -363,45 +401,113 @@ def resolve_shortcut(lnk_path):
 
 
 # ---- HICON → PIL ------------------------------------------------
-def _hicon_to_pil(hicon, size=ICON_SIZE):
-    """把 HICON 绘制到 32bit 兼容位图并转成 PIL.Image (RGBA)。
-    调用后 **一定** 会 DestroyIcon(hicon)，失败返回 None。
-    """
-    hdc_handle = None
-    hdc = None
-    memdc = None
+def _image_has_visible_pixels(img):
+    """判断 PIL RGBA 图像是否有可见像素（alpha 或 RGB 有非零）。"""
+    if img is None:
+        return False
     try:
-        hdc_handle = win32gui.GetDC(0)
-        hdc = win32ui.CreateDCFromHandle(hdc_handle)
-        hbmp = win32ui.CreateBitmap()
-        hbmp.CreateCompatibleBitmap(hdc, size, size)
-        memdc = hdc.CreateCompatibleDC()
-        old = memdc.SelectObject(hbmp)
-        win32gui.DrawIconEx(
-            memdc.GetSafeHdc(), 0, 0, hicon,
-            size, size, 0, 0, win32con.DI_NORMAL
+        bbox = img.getbbox()
+    except Exception:
+        return False
+    return bbox is not None
+
+
+def _rescue_alpha(img):
+    """若图像 alpha 全 0 但 RGB 有内容（DrawIconEx 未写 alpha 的常见情形），
+    根据 RGB 是否非零补一个"看得见"的 alpha，避免图片被当成完全透明。
+    """
+    if img is None:
+        return None
+    try:
+        r, g, b, a = img.split()
+        # 若 alpha 有任何非零值，认为原图 alpha 是有效的，直接返回
+        if a.getextrema()[1] != 0:
+            return img
+        # alpha 全 0：用 RGB 的最大分量作为 alpha（非零像素 → 255）
+        from PIL import ImageChops, ImageMath
+        max_rgb = ImageChops.lighter(ImageChops.lighter(r, g), b)
+        # 二值化：>0 → 255
+        new_a = max_rgb.point(lambda v: 255 if v > 0 else 0, mode="L")
+        return Image.merge("RGBA", (r, g, b, new_a))
+    except Exception as e:
+        print(f"[QuickDeck] _rescue_alpha error: {e}", file=sys.stderr)
+        return img
+
+
+def _hicon_to_pil(hicon, size=ICON_SIZE):
+    """把 HICON 绘制到 32bit BGRA DIB 并转成 PIL.Image (RGBA)。
+    调用后 **一定** 会 DestroyIcon(hicon)。失败返回 None。
+
+    用 CreateDIBSection 而不是 CreateCompatibleBitmap，保证：
+      1) 32bit 位深固定（避免 DDB 遇到 24bpp 桌面时数据错位）
+      2) 拿到原始 BGRA 字节，不受显示驱动格式差异影响
+    并且对 alpha 全 0 的图标做兜底（DrawIconEx 对无 alpha 遗留图标
+    不会写入 alpha 通道，会导致 PhotoImage 显示为完全透明）。
+    """
+    if not hicon:
+        return None
+    _init_win_apis()
+    gdi32 = ctypes.windll.gdi32
+    user32 = ctypes.windll.user32
+
+    hdc_screen = None
+    memdc = None
+    hbmp = None
+    try:
+        hdc_screen = user32.GetDC(None)
+        if not hdc_screen:
+            return None
+        memdc = gdi32.CreateCompatibleDC(hdc_screen)
+        if not memdc:
+            return None
+
+        bi = _BITMAPINFO()
+        bi.bmiHeader.biSize = ctypes.sizeof(_BITMAPINFOHEADER)
+        bi.bmiHeader.biWidth = size
+        bi.bmiHeader.biHeight = -size  # top-down，与 PIL 顺序一致
+        bi.bmiHeader.biPlanes = 1
+        bi.bmiHeader.biBitCount = 32
+        bi.bmiHeader.biCompression = 0  # BI_RGB
+
+        bits_ptr = ctypes.c_void_p()
+        hbmp = gdi32.CreateDIBSection(
+            hdc_screen, ctypes.byref(bi), 0,  # DIB_RGB_COLORS
+            ctypes.byref(bits_ptr), None, 0
         )
-        memdc.SelectObject(old)
-        bmp_bits = hbmp.GetBitmapBits(True)
-        img = Image.frombuffer(
-            "RGBA", (size, size),
-            bmp_bits, "raw", "BGRA", 0, 1
-        )
+        if not hbmp or not bits_ptr.value:
+            return None
+
+        old = gdi32.SelectObject(memdc, hbmp)
+        # DIB 由系统零初始化，DrawIconEx 会把 icon 混色到透明黑背景上
+        user32.DrawIconEx(memdc, 0, 0, hicon,
+                          size, size, 0, None, 3)  # DI_NORMAL = 3
+        gdi32.SelectObject(memdc, old)
+        # 确保 GDI 已把绘图指令刷到 DIB 内存
+        gdi32.GdiFlush()
+
+        # DIB 内存直接映射；读取时拷贝一份，避免释放后悬空
+        raw = ctypes.string_at(bits_ptr.value, size * size * 4)
+        img = Image.frombuffer("RGBA", (size, size), raw, "raw", "BGRA", 0, 1)
+        # DrawIconEx 对老式（无 alpha）图标不会写 alpha，需补救
+        img = _rescue_alpha(img)
+        # 完全空的图像视为失败，让调用方走下一条兜底
+        if not _image_has_visible_pixels(img):
+            return None
         return img
     except Exception as e:
         print(f"[QuickDeck] _hicon_to_pil error: {e}", file=sys.stderr)
         return None
     finally:
-        try:
-            if memdc: memdc.DeleteDC()
-        except Exception: pass
-        try:
-            if hdc: hdc.DeleteDC()
-        except Exception: pass
-        try:
-            if hdc_handle: win32gui.ReleaseDC(0, hdc_handle)
-        except Exception: pass
-        try: win32gui.DestroyIcon(hicon)
+        if hbmp:
+            try: gdi32.DeleteObject(hbmp)
+            except Exception: pass
+        if memdc:
+            try: gdi32.DeleteDC(memdc)
+            except Exception: pass
+        if hdc_screen:
+            try: user32.ReleaseDC(None, hdc_screen)
+            except Exception: pass
+        try: user32.DestroyIcon(hicon)
         except Exception: pass
 
 
@@ -422,6 +528,38 @@ def extract_icon_image(path, index=0, size=ICON_SIZE):
         try: win32gui.DestroyIcon(h)
         except Exception: pass
     return _hicon_to_pil(hicon, size)
+
+
+# ---- PrivateExtractIconsW 兜底 ----------------------------------
+def private_extract_icon(path, size=ICON_SIZE):
+    """用 user32.PrivateExtractIconsW 提取指定尺寸的图标。
+    比 ExtractIconEx 更宽容：能拿到 .NET 内嵌资源、非常规打包 exe 的图标，
+    且可以直接请求任意尺寸而不用后续缩放。
+    """
+    if not path:
+        return None
+    path = _norm_path(path)
+    if not os.path.exists(path):
+        return None
+    _init_win_apis()
+    try:
+        hicon_out = ctypes.c_void_p()
+        id_out = ctypes.c_uint()
+        # LR_DEFAULTCOLOR = 0x00000000
+        n = ctypes.windll.user32.PrivateExtractIconsW(
+            path, 0,
+            size, size,
+            ctypes.byref(hicon_out),
+            ctypes.byref(id_out),
+            1, 0
+        )
+        if n == 0 or n == 0xFFFFFFFF or not hicon_out.value:
+            return None
+        return _hicon_to_pil(hicon_out.value, size)
+    except Exception as e:
+        print(f"[QuickDeck] private_extract_icon error: {e} path={path}",
+              file=sys.stderr)
+        return None
 
 
 # ---- SHGetFileInfoW 兜底 -----------------------------------------
@@ -487,6 +625,10 @@ def _hbitmap_to_pil(hbmp_value, size):
         )
         if (w, h) != (size, size):
             img = img.resize((size, size), Image.LANCZOS)
+        # 有些 shell 返回的位图 alpha 全 0（无 alpha 语义），补救一下
+        img = _rescue_alpha(img)
+        if not _image_has_visible_pixels(img):
+            return None
         return img
     except Exception as e:
         print(f"[QuickDeck] _hbitmap_to_pil error: {e}", file=sys.stderr)
@@ -635,6 +777,12 @@ def get_icon_for_file(path, size=ICON_SIZE):
                 if img is not None:
                     return img
 
+        # PrivateExtractIconsW：能处理 .NET 内嵌资源等 ExtractIconEx 拿不到的场景
+        if target:
+            img = private_extract_icon(target, size)
+            if img is not None:
+                return img
+
         img = imagefactory_icon(path, size)
         if img is not None:
             return img
@@ -652,6 +800,9 @@ def get_icon_for_file(path, size=ICON_SIZE):
                 return img
     else:
         img = extract_icon_image(path, 0, size)
+        if img is not None:
+            return img
+        img = private_extract_icon(path, size)
         if img is not None:
             return img
         img = imagefactory_icon(path, size)
@@ -870,6 +1021,17 @@ class FolderFrame(tk.Frame):
 
     def _reflow(self):
         """按当前 num_cols 把 cards 重排到 body 的 grid。"""
+        # 先让 body 完成挂起的几何计算，读到真实宽度再决定列数；
+        # 否则新建的空文件夹 body.winfo_width() 可能仍是 1，
+        # 导致 _num_cols 停留在初始 1，且列 minsize=500 超出 body 实际宽度。
+        try:
+            self.body.update_idletasks()
+        except Exception:
+            pass
+        actual_w = self.body.winfo_width()
+        if actual_w > 1:
+            self._num_cols = self._compute_num_cols(actual_w)
+
         # 无论 card 之前用的是 pack 还是 grid（且是否在别的 folder），
         # 都清一遍，避免 tk 拒绝在两个几何管理器之间切换的边角情况
         for c in self.cards:
@@ -891,8 +1053,7 @@ class FolderFrame(tk.Frame):
             r, col = i // self._num_cols, i % self._num_cols
             c.grid(row=r, column=col, in_=self.body,
                    padx=4, pady=4, sticky="ew")
-        # 强制立即完成布局：新建的空文件夹刚 pack 时 body 尚未获得实际尺寸，
-        # 不主动 update 会导致新拖入的卡片在下一次事件循环前不可见。
+        # 强制立即完成布局
         try:
             self.update_idletasks()
         except Exception:
@@ -1314,6 +1475,19 @@ class App(tk.Tk):
     def card_drag_end(self, card, event):
         if self.dragging_card is card:
             self.dragging_card = None
+            # 拖拽过程中每次 motion 都做过局部 reflow，但如果最后落点是刚
+            # 新建的空文件夹，body 尚未完成首次布局，卡片可能显示不出。
+            # 收尾时对所有 folder 强制走一次完整 reflow + 顶层 update，
+            # 保证卡片最终一定可见。
+            for f in list(self.folders):
+                try:
+                    f._reflow()
+                except Exception:
+                    pass
+            try:
+                self.update()
+            except Exception:
+                pass
             self.save_state()
 
     def _folder_at_y(self, y_root):
