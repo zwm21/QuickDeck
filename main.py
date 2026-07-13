@@ -214,7 +214,22 @@ class _SHFILEINFOW(ctypes.Structure):
 # ---- Win API 原型集中声明 --------------------------------------
 # 不声明 argtypes 会让 ctypes 默认把参数当 c_int，
 # 64 位地址值超过 int 范围时会抛 "int too long to convert"。
+# 注意：ctypes.HRESULT 作为 restype 时，返回值 < 0（表示失败）会自动 raise OSError，
+# 我们希望"失败=返回 None"，因此下面全部改用 c_long 手动检查 hr。
 _APIS_INITED = False
+
+
+def _norm_path(path):
+    """规范化为绝对路径 + 反斜杠分隔。
+    某些 shell API（SHCreateItemFromParsingName）对 `C:/foo/bar` 这种正斜杠路径
+    返回 E_INVALIDARG，必须转成 `C:\\foo\\bar` 才能被解析。
+    """
+    if not path:
+        return path
+    try:
+        return os.path.normpath(os.path.abspath(path))
+    except Exception:
+        return path
 
 
 def _init_win_apis():
@@ -230,18 +245,18 @@ def _init_win_apis():
         ole32.CLSIDFromString.argtypes = [
             ctypes.c_wchar_p, ctypes.POINTER(_GUID)
         ]
-        ole32.CLSIDFromString.restype = ctypes.HRESULT
+        ole32.CLSIDFromString.restype = ctypes.c_long
 
         ole32.CoInitializeEx.argtypes = [
             ctypes.c_void_p, ctypes.c_ulong
         ]
-        ole32.CoInitializeEx.restype = ctypes.HRESULT
+        ole32.CoInitializeEx.restype = ctypes.c_long
 
         shell32.SHCreateItemFromParsingName.argtypes = [
             ctypes.c_wchar_p, ctypes.c_void_p,
             ctypes.POINTER(_GUID), ctypes.POINTER(ctypes.c_void_p)
         ]
-        shell32.SHCreateItemFromParsingName.restype = ctypes.HRESULT
+        shell32.SHCreateItemFromParsingName.restype = ctypes.c_long
 
         shell32.SHGetFileInfoW.argtypes = [
             ctypes.c_wchar_p, ctypes.c_ulong,
@@ -319,6 +334,7 @@ def _com_release(obj_ptr):
 # ---- 解析 .lnk --------------------------------------------------
 def resolve_shortcut(lnk_path):
     """解析 .lnk 得到 (target, icon_path, icon_index)。"""
+    lnk_path = _norm_path(lnk_path)
     try:
         shell = win32com.client.Dispatch("WScript.Shell")
         sc = shell.CreateShortcut(lnk_path)
@@ -335,11 +351,11 @@ def resolve_shortcut(lnk_path):
         else:
             icon_path = icon_location.strip() or target
             icon_index = 0
-        # 展开 %SystemRoot% 之类的环境变量
+        # 展开 %SystemRoot% 之类的环境变量 + 规范化分隔符
         if target:
-            target = os.path.expandvars(target)
+            target = _norm_path(os.path.expandvars(target))
         if icon_path:
-            icon_path = os.path.expandvars(icon_path)
+            icon_path = _norm_path(os.path.expandvars(icon_path))
         return target, icon_path, icon_index
     except Exception as e:
         print(f"[QuickDeck] resolve_shortcut error: {e}", file=sys.stderr)
@@ -413,6 +429,7 @@ def shget_icon_image(path, size=ICON_SIZE):
     """shell32.SHGetFileInfoW → Explorer 里显示的图标。"""
     if not path:
         return None
+    path = _norm_path(path)
     _init_win_apis()
     try:
         info = _SHFILEINFOW()
@@ -423,10 +440,13 @@ def shget_icon_image(path, size=ICON_SIZE):
             path, 0, ctypes.byref(info), ctypes.sizeof(info), flags
         )
         if not ret or not info.hIcon:
+            print(f"[QuickDeck] shget_icon_image: no icon for {path}",
+                  file=sys.stderr)
             return None
         return _hicon_to_pil(info.hIcon, size)
     except Exception as e:
-        print(f"[QuickDeck] shget_icon_image error: {e}", file=sys.stderr)
+        print(f"[QuickDeck] shget_icon_image error: {e} path={path}",
+              file=sys.stderr)
         return None
 
 
@@ -487,6 +507,8 @@ def imagefactory_icon(path, size=ICON_SIZE):
     """
     if not path:
         return None
+    # SHCreateItemFromParsingName 对 `C:/...` 正斜杠路径直接 E_INVALIDARG
+    path = _norm_path(path)
     _init_win_apis()
     _ensure_com()
 
@@ -503,6 +525,11 @@ def imagefactory_icon(path, size=ICON_SIZE):
             ctypes.byref(iid_item), ctypes.byref(item_ptr)
         )
         if hr != 0 or not item_ptr.value:
+            print(
+                f"[QuickDeck] imagefactory_icon: "
+                f"SHCreateItem hr=0x{hr & 0xFFFFFFFF:08x} for {path}",
+                file=sys.stderr,
+            )
             return None
 
         # item->QueryInterface(IID_IShellItemImageFactory, &factory)
@@ -510,7 +537,7 @@ def imagefactory_icon(path, size=ICON_SIZE):
             item_ptr, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))
         )[0]
         qi_ft = ctypes.WINFUNCTYPE(
-            ctypes.HRESULT, ctypes.c_void_p,
+            ctypes.c_long, ctypes.c_void_p,
             ctypes.POINTER(_GUID), ctypes.POINTER(ctypes.c_void_p)
         )
         qi_addr = vtbl_item[0]
@@ -520,6 +547,11 @@ def imagefactory_icon(path, size=ICON_SIZE):
         qi = ctypes.cast(ctypes.c_void_p(qi_addr), qi_ft)
         hr = qi(item_ptr, ctypes.byref(iid_factory), ctypes.byref(factory_ptr))
         if hr != 0 or not factory_ptr.value:
+            print(
+                f"[QuickDeck] imagefactory_icon: "
+                f"QueryInterface hr=0x{hr & 0xFFFFFFFF:08x} for {path}",
+                file=sys.stderr,
+            )
             return None
 
         # factory->GetImage((cx, cy), flags, &hbmp) (vtable[3])
@@ -528,7 +560,7 @@ def imagefactory_icon(path, size=ICON_SIZE):
             factory_ptr, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))
         )[0]
         gi_ft = ctypes.WINFUNCTYPE(
-            ctypes.HRESULT, ctypes.c_void_p,
+            ctypes.c_long, ctypes.c_void_p,
             _SIZE, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p)
         )
         gi_addr = vtbl_fac[3]
@@ -541,11 +573,17 @@ def imagefactory_icon(path, size=ICON_SIZE):
             ctypes.byref(hbmp)
         )
         if hr != 0 or not hbmp.value:
+            print(
+                f"[QuickDeck] imagefactory_icon: "
+                f"GetImage hr=0x{hr & 0xFFFFFFFF:08x} for {path}",
+                file=sys.stderr,
+            )
             return None
 
         return _hbitmap_to_pil(hbmp.value, size)
     except Exception as e:
-        print(f"[QuickDeck] imagefactory_icon error: {e}", file=sys.stderr)
+        print(f"[QuickDeck] imagefactory_icon error: {e} path={path}",
+              file=sys.stderr)
         return None
     finally:
         if hbmp and hbmp.value:
@@ -575,6 +613,7 @@ def get_icon_for_file(path, size=ICON_SIZE):
     """
     if not HAS_WIN32:
         return None
+    path = _norm_path(path)
     ext = os.path.splitext(path)[1].lower()
     tried = set()
 
@@ -831,9 +870,15 @@ class FolderFrame(tk.Frame):
 
     def _reflow(self):
         """按当前 num_cols 把 cards 重排到 body 的 grid。"""
+        # 无论 card 之前用的是 pack 还是 grid（且是否在别的 folder），
+        # 都清一遍，避免 tk 拒绝在两个几何管理器之间切换的边角情况
         for c in self.cards:
             try:
                 c.grid_forget()
+            except Exception:
+                pass
+            try:
+                c.pack_forget()
             except Exception:
                 pass
         cw = ShortcutCard.CARD_WIDTH
@@ -846,6 +891,12 @@ class FolderFrame(tk.Frame):
             r, col = i // self._num_cols, i % self._num_cols
             c.grid(row=r, column=col, in_=self.body,
                    padx=4, pady=4, sticky="ew")
+        # 强制立即完成布局：新建的空文件夹刚 pack 时 body 尚未获得实际尺寸，
+        # 不主动 update 会导致新拖入的卡片在下一次事件循环前不可见。
+        try:
+            self.update_idletasks()
+        except Exception:
+            pass
 
 
 # ================================================================
@@ -1062,6 +1113,12 @@ class App(tk.Tk):
         f = FolderFrame(self.inner_frame, self, folder_id, name)
         f.pack(fill="x", padx=6, pady=(6, 0))
         self.folders.append(f)
+        # 立即完成布局，让 body 拿到真实宽度；否则下一步若立刻往空文件夹里
+        # 拖卡片，会因为 body.winfo_width() 还没有值而导致卡片显示不出。
+        try:
+            self.inner_frame.update_idletasks()
+        except Exception:
+            pass
         return f
 
     def _on_new_folder(self):
@@ -1305,12 +1362,21 @@ class App(tk.Tk):
 
     def _move_card_to(self, card, target_folder, target_pos):
         src_folder = card.folder
+        # 明确解除 card 现有的 grid 绑定，避免 in_ 从 src.body 换到
+        # target.body 时 tk 遗留状态导致新位置不可见
+        try:
+            card.grid_forget()
+        except Exception:
+            pass
+
         if src_folder is target_folder:
             cur = src_folder.cards.index(card)
             # 同文件夹内：把 target_pos 修正为"移除 card 后的目标位置"
             if target_pos > cur:
                 target_pos -= 1
             if cur == target_pos:
+                # 顺序未变，也要把刚才 grid_forget 的 card 补回原位
+                src_folder._reflow()
                 return
             src_folder.cards.remove(card)
             src_folder.cards.insert(target_pos, card)
@@ -1320,8 +1386,9 @@ class App(tk.Tk):
                 src_folder.cards.remove(card)
                 src_folder._reflow()
             target_folder.insert_card(card, target_pos)
+        # 全局强制刷新一次，确保新宿主的 grid 立即完成布局
         try:
-            self.inner_frame.update_idletasks()
+            self.update_idletasks()
         except Exception:
             pass
 
