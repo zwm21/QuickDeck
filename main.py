@@ -90,36 +90,254 @@ def enable_dpi_awareness():
 # ================================================================
 # 配置读写
 # ================================================================
-def _merge_dict(base, override):
-    """把 override 的字段递归合并到 base，保证 base 拥有完整结构。"""
+CONFIG_BAK_FILE = CONFIG_FILE + ".bak"
+CONFIG_TMP_FILE = CONFIG_FILE + ".tmp"
+CONFIG_CORRUPT_FILE = CONFIG_FILE + ".corrupt"
+
+# _merge_dict 允许的最大递归深度：正常配置最多 3-4 层嵌套，
+# 32 层已远超合理值；超过即视为恶意构造或损坏，停止递归以防栈溢出。
+_MERGE_MAX_DEPTH = 32
+
+
+def _merge_dict(base, override, depth=0):
+    """把 override 的字段递归合并到 base，保证 base 拥有完整结构。
+
+    - depth 超过 _MERGE_MAX_DEPTH 时不再递归，直接用 override 覆盖，
+      避免构造超深嵌套的 JSON 触发 RecursionError。
+    - override 不是 dict 时也直接返回 base（防御 _sanitize 前的调用者）。
+    """
+    if depth >= _MERGE_MAX_DEPTH or not isinstance(override, dict):
+        return override if isinstance(override, dict) else base
     for k, v in override.items():
         if isinstance(v, dict) and isinstance(base.get(k), dict):
-            base[k] = _merge_dict(base[k], v)
+            base[k] = _merge_dict(base[k], v, depth + 1)
         else:
             base[k] = v
     return base
 
 
-def load_config():
-    """从 config.json 加载配置；缺失或损坏时使用默认值。"""
-    cfg = copy.deepcopy(DEFAULT_CONFIG)
-    if os.path.exists(CONFIG_FILE):
+def _sanitize_config(cfg):
+    """加载后逐字段做类型/范围校验，非法值就地回落到默认，返回 cfg 本身。
+
+    load_config 走 _merge_dict 后所有字段仍可能被用户手改成任意类型，
+    这里把它们统一约束到 GUI 期望的形态，避免 App.__init__ / 加载卡片
+    / sorted key 等地方直接 raise 导致启动失败或卡片全部丢失。
+    """
+    if not isinstance(cfg, dict):
+        return copy.deepcopy(DEFAULT_CONFIG)
+
+    # ---- window ----
+    default_w = DEFAULT_CONFIG["window"]
+    w = cfg.get("window")
+    if not isinstance(w, dict):
+        w = {}
+    def _int_or(default, val, lo=None, hi=None):
         try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                loaded = json.load(f)
-            cfg = _merge_dict(cfg, loaded)
-        except Exception as e:
-            print(f"[QuickDeck] load_config error: {e}", file=sys.stderr)
+            v = int(val)
+        except (TypeError, ValueError):
+            return default
+        if lo is not None and v < lo:
+            v = lo
+        if hi is not None and v > hi:
+            v = hi
+        return v
+    cfg["window"] = {
+        "width": _int_or(default_w["width"], w.get("width"),
+                         lo=100, hi=20000),
+        "height": _int_or(default_w["height"], w.get("height"),
+                          lo=100, hi=20000),
+        # x/y 允许负值（多显示器左侧屏），范围放宽；越界最终会在
+        # App.__init__ 里按当前屏幕再兜底一次
+        "x": _int_or(default_w["x"], w.get("x"), lo=-20000, hi=20000),
+        "y": _int_or(default_w["y"], w.get("y"), lo=-20000, hi=20000),
+    }
+
+    # ---- font ----
+    default_f = DEFAULT_CONFIG["font"]
+    f = cfg.get("font")
+    if not isinstance(f, dict):
+        f = {}
+    fam = f.get("family")
+    if not isinstance(fam, str) or not fam.strip():
+        fam = default_f["family"]
+    cfg["font"] = {
+        "family": fam,
+        "size": _int_or(default_f["size"], f.get("size"), lo=8, hi=36),
+    }
+
+    # ---- card_width ----
+    cfg["card_width"] = _int_or(
+        DEFAULT_CONFIG["card_width"], cfg.get("card_width"),
+        lo=200, hi=1200
+    )
+
+    # ---- folders ----
+    raw_folders = cfg.get("folders")
+    clean_folders = []
+    if isinstance(raw_folders, list):
+        for i, fd in enumerate(raw_folders):
+            if not isinstance(fd, dict):
+                continue
+            fid = fd.get("id")
+            if not isinstance(fid, str) or not fid.strip():
+                fid = "f_" + uuid.uuid4().hex[:8]
+            name = fd.get("name")
+            if not isinstance(name, str) or not name.strip():
+                name = "未命名"
+            order = _int_or(i, fd.get("order"), lo=-10**9, hi=10**9)
+            locked = bool(fd.get("locked"))
+            clean_folders.append({
+                "id": fid, "name": name,
+                "order": order, "locked": locked,
+            })
+    cfg["folders"] = clean_folders  # 允许为空，_load_from_config 会兜底建默认
+
+    # ---- shortcuts ----
+    raw_items = cfg.get("shortcuts")
+    clean_items = []
+    if isinstance(raw_items, list):
+        for i, it in enumerate(raw_items):
+            if not isinstance(it, dict):
+                continue
+            p = it.get("path")
+            if not isinstance(p, str) or not p:
+                continue
+            desc = it.get("description", "")
+            if not isinstance(desc, str):
+                desc = ""
+            fid = it.get("folder")
+            if not isinstance(fid, str) or not fid:
+                fid = ""
+            order = _int_or(i, it.get("order"), lo=-10**9, hi=10**9)
+            clean_items.append({
+                "path": p, "description": desc,
+                "folder": fid, "order": order,
+            })
+    cfg["shortcuts"] = clean_items
+
     return cfg
 
 
-def save_config(cfg):
-    """把配置字典写回 config.json（UTF-8 + 缩进）。"""
+def _read_config_file(path):
+    """读取并合并到默认结构；失败时抛异常。"""
+    cfg = copy.deepcopy(DEFAULT_CONFIG)
+    with open(path, "r", encoding="utf-8") as f:
+        loaded = json.load(f)
+    if not isinstance(loaded, dict):
+        raise ValueError("config root is not a JSON object")
+    cfg = _merge_dict(cfg, loaded)
+    return _sanitize_config(cfg)
+
+
+def load_config():
+    """从 config.json 加载配置。
+
+    - 文件不存在：返回默认。
+    - 加载失败：先隔离坏文件到 config.json.corrupt，再尝试 .bak；
+      两个都不行时用 messagebox 让用户在"备份坏文件并使用默认" /
+      "退出程序检查文件" 之间选择，避免下次 save 无声覆盖坏数据。
+    """
+    if not os.path.exists(CONFIG_FILE):
+        # 主文件缺失但有 .bak，尝试恢复
+        if os.path.exists(CONFIG_BAK_FILE):
+            try:
+                return _read_config_file(CONFIG_BAK_FILE)
+            except Exception as e:
+                print(f"[QuickDeck] load bak fallback failed: {e}",
+                      file=sys.stderr)
+        return _sanitize_config(copy.deepcopy(DEFAULT_CONFIG))
+
     try:
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        return _read_config_file(CONFIG_FILE)
+    except Exception as primary_err:
+        print(f"[QuickDeck] load_config primary error: {primary_err}",
+              file=sys.stderr)
+
+    # 主文件读取失败：尝试 .bak
+    bak_cfg = None
+    bak_err = None
+    if os.path.exists(CONFIG_BAK_FILE):
+        try:
+            bak_cfg = _read_config_file(CONFIG_BAK_FILE)
+        except Exception as e:
+            bak_err = e
+            print(f"[QuickDeck] load_config bak error: {e}",
+                  file=sys.stderr)
+
+    # 有可用 .bak：把损坏主文件挪走 → 用 .bak 覆盖 → 使用 .bak
+    if bak_cfg is not None:
+        try:
+            os.replace(CONFIG_FILE, CONFIG_CORRUPT_FILE)
+        except Exception:
+            pass
+        # 弹窗告知，避免用户以为一切正常
+        try:
+            messagebox.showwarning(
+                "配置文件损坏",
+                "config.json 无法解析，已隔离为 config.json.corrupt，"
+                "并使用最近一次成功保存的备份 config.json.bak 恢复。"
+            )
+        except Exception:
+            pass
+        return bak_cfg
+
+    # .bak 也不可用：询问用户
+    try:
+        choice = messagebox.askyesno(
+            "配置文件损坏",
+            "config.json 无法解析，且没有可用的 .bak 备份。\n\n"
+            f"主文件错误：{primary_err}\n"
+            + (f"备份错误：{bak_err}\n" if bak_err else "")
+            + "\n是（Yes）：备份坏文件为 config.json.corrupt 并使用默认设置继续启动。"
+            "\n否（No）：立即退出程序，让你手动检查文件。"
+        )
+    except Exception:
+        choice = True  # 无 GUI 环境时默认继续
+    if not choice:
+        sys.exit(1)
+    try:
+        os.replace(CONFIG_FILE, CONFIG_CORRUPT_FILE)
+    except Exception:
+        pass
+    return _sanitize_config(copy.deepcopy(DEFAULT_CONFIG))
+
+
+def save_config(cfg):
+    """原子写回 config.json。
+
+    步骤：
+      1. 写 config.json.tmp（fsync 落盘）
+      2. 用 os.replace 原子替换 config.json；替换前把旧主文件
+         另存为 config.json.bak，保留一次可回滚的历史
+    出错保留旧 config.json 不被破坏。
+    """
+    try:
+        # 1) 写临时文件；先 flush + fsync 保证内容真的到磁盘再 rename
+        with open(CONFIG_TMP_FILE, "w", encoding="utf-8") as f:
             json.dump(cfg, f, ensure_ascii=False, indent=2)
+            try:
+                f.flush()
+                os.fsync(f.fileno())
+            except (OSError, AttributeError):
+                pass
+
+        # 2) 先把当前主文件挪到 .bak（保留上次成功的完整版本），
+        #    然后把 tmp 原子替换为主文件
+        if os.path.exists(CONFIG_FILE):
+            try:
+                os.replace(CONFIG_FILE, CONFIG_BAK_FILE)
+            except OSError as e:
+                print(f"[QuickDeck] backup rotate failed: {e}",
+                      file=sys.stderr)
+        os.replace(CONFIG_TMP_FILE, CONFIG_FILE)
     except Exception as e:
         print(f"[QuickDeck] save_config error: {e}", file=sys.stderr)
+        # 清理可能残留的 tmp，避免下次干扰
+        try:
+            if os.path.exists(CONFIG_TMP_FILE):
+                os.remove(CONFIG_TMP_FILE)
+        except OSError:
+            pass
 
 
 # ================================================================
@@ -1224,11 +1442,28 @@ class App(tk.Tk):
         self.cfg = load_config()
         load_local_font(LOCAL_FONT_FILE)
 
+        # _sanitize_config 已经把 window.* 保证为 int 且在合理范围；
+        # 但配置里记的 x/y 可能对应已拔掉的显示器坐标（多屏用户）。
+        # 用当前主屏尺寸做一次可见性校验：若窗口右下角完全在屏幕外，
+        # 就把 x/y 重置到主屏可见范围内，避免"启动后窗口飞到看不见的地方"。
         wcfg = self.cfg["window"]
-        self.geometry(
-            f"{int(wcfg.get('width', 900))}x{int(wcfg.get('height', 650))}"
-            f"+{int(wcfg.get('x', 200))}+{int(wcfg.get('y', 100))}"
-        )
+        w = int(wcfg["width"])
+        h = int(wcfg["height"])
+        x = int(wcfg["x"])
+        y = int(wcfg["y"])
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        # 至少要有 100x60 的区域落在主屏内（覆盖大部分多屏边缘可拖回场景），
+        # 否则视为不可见，重排到主屏居中
+        visible_x_min = -w + 100
+        visible_x_max = sw - 100
+        visible_y_min = 0        # 顶部标题栏不能被裁掉
+        visible_y_max = sh - 60
+        if not (visible_x_min <= x <= visible_x_max
+                and visible_y_min <= y <= visible_y_max):
+            x = max(0, (sw - w) // 2)
+            y = max(0, (sh - h) // 2)
+        self.geometry(f"{w}x{h}+{x}+{y}")
         self.minsize(560, 380)
 
         self.app_font = tkFont.Font(
