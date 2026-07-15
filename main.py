@@ -12,7 +12,10 @@ import sys
 import json
 import copy
 import uuid
+import queue
 import ctypes
+import hashlib
+import threading
 import subprocess
 import tkinter as tk
 from tkinter import ttk, font as tkFont, filedialog, messagebox, simpledialog
@@ -120,6 +123,59 @@ DEFAULT_CONFIG = {
     "card_width": 500,
     "shortcuts": []
 }
+
+
+# ================================================================
+# 主题（浅色 / 深色）
+# ================================================================
+LIGHT_THEME = {
+    "name": "light",
+    "app_bg": "#F0F0F0",           # 主窗口 / 滚动区背景
+    "panel_bg": "#F8F9FA",         # 底部字体设置卡片
+    "card_bg": "#FFFFFF",          # 快捷方式卡片
+    "desc_bg": "#F4F4F4",          # 描述输入框
+    "folder_bg": "#F5F5F5",        # 文件夹框体 / body
+    "header_bg": "#E0E0E0",        # 文件夹 header
+    "fg": "#000000",               # 常规文字
+    "header_fg": "#333333",        # header 上的图标按钮
+    "danger_fg": "#B22222",        # 删除类按钮文字
+    "danger_active_bg": "#FADBD8",
+    "header_active_bg": "#D0D0D0",
+    "btn_bg": "#F0F0F0",           # 工具栏按钮
+    "btn_active_bg": "#E2E2E2",
+}
+
+DARK_THEME = {
+    "name": "dark",
+    "app_bg": "#1F1F1F",
+    "panel_bg": "#2A2A2A",
+    "card_bg": "#2D2D30",
+    "desc_bg": "#3C3C3C",
+    "folder_bg": "#262626",
+    "header_bg": "#333333",
+    "fg": "#E6E6E6",
+    "header_fg": "#CCCCCC",
+    "danger_fg": "#E57373",
+    "danger_active_bg": "#5C2B2B",
+    "header_active_bg": "#454545",
+    "btn_bg": "#3A3A3A",
+    "btn_active_bg": "#4A4A4A",
+}
+
+
+def system_prefers_light():
+    """读注册表 AppsUseLightTheme（1=浅色，0=深色）。读不到按浅色处理。"""
+    try:
+        import winreg
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion"
+            r"\Themes\Personalize"
+        ) as k:
+            v, _t = winreg.QueryValueEx(k, "AppsUseLightTheme")
+            return bool(v)
+    except Exception:
+        return True
 
 
 # ================================================================
@@ -643,7 +699,9 @@ def _init_win_apis():
 
 
 # ---- COM 辅助 ---------------------------------------------------
-_COM_INITED = False
+# COM 初始化是 per-thread 的：主线程和图标 worker 线程都要各自
+# CoInitializeEx 一次，用 thread-local 记录本线程是否已初始化
+_com_tls = threading.local()
 
 
 def _iid(s):
@@ -654,16 +712,15 @@ def _iid(s):
 
 
 def _ensure_com():
-    global _COM_INITED
-    if _COM_INITED:
+    if getattr(_com_tls, "inited", False):
         return
     _init_win_apis()
     try:
-        # 0x2 = COINIT_APARTMENTTHREADED，tk 主线程用 STA
+        # 0x2 = COINIT_APARTMENTTHREADED（STA；tk 主线程与 worker 均适用）
         ctypes.windll.ole32.CoInitializeEx(None, 0x2)
     except Exception:
         pass
-    _COM_INITED = True
+    _com_tls.inited = True
 
 
 def _com_release(obj_ptr):
@@ -1068,6 +1125,9 @@ def get_icon_for_file(path, size=ICON_SIZE):
     """
     if not HAS_WIN32:
         return None
+    # 统一入口保证当前线程完成 COM 初始化（worker 线程里的
+    # WScript.Shell Dispatch 与 IShellItemImageFactory 都依赖它）
+    _ensure_com()
     path = _norm_path(path)
     ext = os.path.splitext(path)[1].lower()
     tried = set()
@@ -1147,6 +1207,66 @@ def make_default_icon(size=ICON_SIZE):
 
 
 # ================================================================
+# 图标缓存（内存 dict + 磁盘 PNG，key = 规范化路径 + mtime）
+# ================================================================
+_icon_mem_cache = {}
+_icon_cache_lock = threading.Lock()
+
+
+def _icon_cache_key(path):
+    """(规范化绝对路径, mtime_ns)；文件不存在时 mtime 记 0。
+    mtime 进 key 保证快捷方式被替换/更新后缓存自动失效。"""
+    p = os.path.normcase(os.path.abspath(path))
+    try:
+        mtime = os.stat(p).st_mtime_ns
+    except OSError:
+        mtime = 0
+    return p, mtime
+
+
+def _icon_cache_file(key):
+    name = hashlib.sha1(
+        f"{key[0]}|{key[1]}".encode("utf-8", "replace")).hexdigest()
+    return os.path.join(
+        os.path.dirname(ACTIVE_CONFIG_FILE), "icon_cache", name + ".png")
+
+
+def icon_cache_get(path):
+    """先查内存，再查磁盘 PNG（磁盘命中会回填内存）。未命中返回 None。"""
+    key = _icon_cache_key(path)
+    with _icon_cache_lock:
+        pil = _icon_mem_cache.get(key)
+    if pil is not None:
+        return pil
+    fp = _icon_cache_file(key)
+    try:
+        if os.path.exists(fp):
+            img = Image.open(fp)
+            img.load()
+            if img.mode != "RGBA":
+                img = img.convert("RGBA")
+            with _icon_cache_lock:
+                _icon_mem_cache[key] = img
+            return img
+    except Exception as e:
+        print(f"[QuickDeck] icon cache read failed: {e}", file=sys.stderr)
+    return None
+
+
+def icon_cache_put(path, pil):
+    """写内存 + 磁盘。磁盘写失败只打日志（缓存是加速手段，不是功能依赖）。"""
+    key = _icon_cache_key(path)
+    with _icon_cache_lock:
+        _icon_mem_cache[key] = pil
+    fp = _icon_cache_file(key)
+    try:
+        os.makedirs(os.path.dirname(fp), exist_ok=True)
+        pil.save(fp, "PNG")
+    except Exception as e:
+        print(f"[QuickDeck] icon cache write failed: {e}", file=sys.stderr)
+
+
+# ================================================================
 # 快捷方式卡片
 # ================================================================
 class ShortcutCard(tk.Frame):
@@ -1159,43 +1279,52 @@ class ShortcutCard(tk.Frame):
 
     def __init__(self, master, app, path, description="",
                  custom_title="", custom_icon=""):
+        th = app.theme
         super().__init__(master, bd=1, relief="solid",
-                         padx=8, pady=6, bg="#FFFFFF")
+                         padx=8, pady=6, bg=th["card_bg"])
         self.app = app
         self.path = path
         self.folder = None  # 由 FolderFrame.add_card / insert_card 设置
         self.custom_title = custom_title or ""
         self.custom_icon = custom_icon or ""
 
-        # 图标（优先自定义图标文件，失败回落到自动提取）
+        # 图标：
+        #   1) 自定义图标文件 → 同步加载（本地图像，开销小）
+        #   2) (path, mtime) 缓存命中 → 同步用缓存（含磁盘 PNG，重启后有效）
+        #   3) 未命中 → 先贴默认占位图标，交给 App 的 worker 线程异步提取，
+        #      避免几十张卡片启动时把 UI 卡住
         pil = None
+        pending_async = False
         if self.custom_icon:
             pil = self._load_icon_file(self.custom_icon)
         if pil is None and HAS_WIN32:
-            pil = get_icon_for_file(path)
+            pil = icon_cache_get(path)
         if pil is None:
             pil = app.default_icon_img
+            pending_async = HAS_WIN32
         self.icon_pil = pil
         self.icon_photo = ImageTk.PhotoImage(pil)
 
         self.icon_label = tk.Label(self, image=self.icon_photo,
-                                   bg="#FFFFFF", cursor="fleur")
+                                   bg=th["card_bg"], cursor="fleur")
         self.icon_label.pack(side="left", padx=(0, 8))
 
-        mid = tk.Frame(self, bg="#FFFFFF")
+        mid = tk.Frame(self, bg=th["card_bg"])
         mid.pack(side="left", fill="both", expand=True)
         self.mid = mid
 
         title_text = self.custom_title or get_title_for_file(path)
         self.title_label = tk.Label(mid, text=title_text, anchor="w",
-                                    font=app.app_font, bg="#FFFFFF",
-                                    cursor="fleur")
+                                    font=app.app_font, bg=th["card_bg"],
+                                    fg=th["fg"], cursor="fleur")
         self.title_label.pack(fill="x")
 
         self.desc_var = tk.StringVar(value=description)
         self.desc_entry = tk.Entry(mid, textvariable=self.desc_var,
                                    font=app.app_font, relief="flat",
-                                   bg="#F4F4F4")
+                                   bg=th["desc_bg"], fg=th["fg"],
+                                   insertbackground=th["fg"],
+                                   readonlybackground=th["desc_bg"])
         self.desc_entry.pack(fill="x", pady=(3, 0))
         self.desc_entry.bind("<FocusOut>",
                              lambda e: self.app.save_state())
@@ -1204,8 +1333,8 @@ class ShortcutCard(tk.Frame):
 
         self.del_btn = tk.Button(self, text="\u274C",  # ❌
                                  width=3, font=app.app_font, relief="flat",
-                                 bg="#FFFFFF", fg="#B22222",
-                                 activebackground="#FADBD8",
+                                 bg=th["card_bg"], fg=th["danger_fg"],
+                                 activebackground=th["danger_active_bg"],
                                  command=self._on_delete)
         self.del_btn.pack(side="right", padx=(8, 0))
 
@@ -1216,6 +1345,22 @@ class ShortcutCard(tk.Frame):
             w.bind("<ButtonRelease-1>", self._on_drag_end)
             w.bind("<Double-Button-1>", self._on_double_click)
             w.bind("<Button-3>", self._on_right_click)
+
+        # widget 就绪后再入队异步提取（结果经主线程轮询回填）
+        if pending_async:
+            app.request_icon(self)
+
+    def set_extracted_icon(self, pil):
+        """worker 线程提取完成后由主线程调用，回填真实图标。
+        若期间用户已设置自定义图标，则忽略迟到的提取结果。"""
+        if self.custom_icon:
+            return
+        try:
+            self.icon_pil = pil
+            self.icon_photo = ImageTk.PhotoImage(pil)
+            self.icon_label.configure(image=self.icon_photo)
+        except tk.TclError:
+            pass  # 卡片可能已被销毁
 
     # ---- 自定义图标 ----
     @staticmethod
@@ -1261,7 +1406,11 @@ class ShortcutCard(tk.Frame):
 
     # ---- 右键菜单 ----
     def _on_right_click(self, e):
-        menu = tk.Menu(self, tearoff=0, font=self.app.app_font)
+        th = self.app.theme
+        menu = tk.Menu(self, tearoff=0, font=self.app.app_font,
+                       bg=th["card_bg"], fg=th["fg"],
+                       activebackground=th["header_active_bg"],
+                       activeforeground=th["fg"])
         locked = (self.folder is not None
                   and getattr(self.folder, "locked", False))
         state = "disabled" if locked else "normal"
@@ -1273,7 +1422,10 @@ class ShortcutCard(tk.Frame):
                          command=self._menu_edit_desc, state=state)
         menu.add_separator()
         # 移动到指定文件夹（锁定时禁止移出）
-        move_menu = tk.Menu(menu, tearoff=0, font=self.app.app_font)
+        move_menu = tk.Menu(menu, tearoff=0, font=self.app.app_font,
+                            bg=th["card_bg"], fg=th["fg"],
+                            activebackground=th["header_active_bg"],
+                            activeforeground=th["fg"])
         for f in self.app.folders:
             if f is self.folder:
                 continue
@@ -1399,6 +1551,25 @@ class ShortcutCard(tk.Frame):
             except Exception:
                 pass
 
+    # ---- 主题 ----
+    def apply_theme(self):
+        """按 app.theme 重刷本卡片配色（运行时深/浅色切换用）。"""
+        th = self.app.theme
+        try:
+            self.configure(bg=th["card_bg"])
+            self.icon_label.configure(bg=th["card_bg"])
+            self.mid.configure(bg=th["card_bg"])
+            self.title_label.configure(bg=th["card_bg"], fg=th["fg"])
+            self.desc_entry.configure(
+                bg=th["desc_bg"], fg=th["fg"],
+                insertbackground=th["fg"],
+                readonlybackground=th["desc_bg"])
+            self.del_btn.configure(
+                bg=th["card_bg"], fg=th["danger_fg"],
+                activebackground=th["danger_active_bg"])
+        except tk.TclError:
+            pass
+
 
 # ================================================================
 # 文件夹
@@ -1416,7 +1587,8 @@ class FolderFrame(tk.Frame):
         return int(self.app.card_width) + 10
 
     def __init__(self, master, app, folder_id, name):
-        super().__init__(master, bd=1, relief="solid", bg="#F5F5F5")
+        th = app.theme
+        super().__init__(master, bd=1, relief="solid", bg=th["folder_bg"])
         self.app = app
         self.id = folder_id
         self.name = name
@@ -1425,7 +1597,7 @@ class FolderFrame(tk.Frame):
         self.locked = False  # 上锁时禁用名字编辑 / 卡片编辑 / 卡片拖拽 / 删除
 
         # ---- header（紧凑：小 padding，无冗余空间） ----
-        header = tk.Frame(self, bg="#E0E0E0", padx=4, pady=1)
+        header = tk.Frame(self, bg=th["header_bg"], padx=4, pady=1)
         header.pack(fill="x")
         self.header = header
 
@@ -1437,14 +1609,16 @@ class FolderFrame(tk.Frame):
 
         self.drag_handle = tk.Label(
             header, text="\u2630", font=self._header_font,  # ☰
-            bg="#E0E0E0", cursor="fleur", padx=2
+            bg=th["header_bg"], fg=th["fg"], cursor="fleur", padx=2
         )
         self.drag_handle.pack(side="left")
 
         self.name_var = tk.StringVar(value=name)
         self.name_entry = tk.Entry(
             header, textvariable=self.name_var,
-            font=self._header_font, bd=0, bg="#E0E0E0",
+            font=self._header_font, bd=0, bg=th["header_bg"],
+            fg=th["fg"], insertbackground=th["fg"],
+            readonlybackground=th["header_bg"],
             highlightthickness=0
         )
         self.name_entry.pack(side="left", fill="x", expand=True, padx=(2, 4))
@@ -1455,8 +1629,8 @@ class FolderFrame(tk.Frame):
         self.lock_btn = tk.Button(
             header, text="\U0001F513",  # 🔓
             font=self._header_font, relief="flat", bd=0,
-            bg="#E0E0E0", fg="#333333",
-            activebackground="#D0D0D0",
+            bg=th["header_bg"], fg=th["header_fg"],
+            activebackground=th["header_active_bg"],
             padx=4, pady=0,
             command=self._on_toggle_lock
         )
@@ -1467,15 +1641,15 @@ class FolderFrame(tk.Frame):
         self.del_btn = tk.Button(
             header, text="\u2716",  # ✖
             font=self._header_font, relief="flat", bd=0,
-            bg="#E0E0E0", fg="#B22222",
-            activebackground="#FADBD8",
+            bg=th["header_bg"], fg=th["danger_fg"],
+            activebackground=th["danger_active_bg"],
             padx=4, pady=0,
             command=self._on_delete
         )
         self.del_btn.pack(side="right")
 
         # ---- body（卡片 grid 容器；padding 也收紧） ----
-        self.body = tk.Frame(self, bg="#F5F5F5", padx=4, pady=3)
+        self.body = tk.Frame(self, bg=th["folder_bg"], padx=4, pady=3)
         self.body.pack(fill="both", expand=True)
         self.body.bind("<Configure>", self._on_body_configure)
 
@@ -1493,6 +1667,27 @@ class FolderFrame(tk.Frame):
                 size=max(8, int(self.app.app_font.cget("size")) - 1)
             )
         except Exception:
+            pass
+
+    def apply_theme(self):
+        """按 app.theme 重刷本文件夹配色（运行时深/浅色切换用）。"""
+        th = self.app.theme
+        try:
+            self.configure(bg=th["folder_bg"])
+            self.header.configure(bg=th["header_bg"])
+            self.drag_handle.configure(bg=th["header_bg"], fg=th["fg"])
+            self.name_entry.configure(
+                bg=th["header_bg"], fg=th["fg"],
+                insertbackground=th["fg"],
+                readonlybackground=th["header_bg"])
+            self.lock_btn.configure(
+                bg=th["header_bg"], fg=th["header_fg"],
+                activebackground=th["header_active_bg"])
+            self.del_btn.configure(
+                bg=th["header_bg"], fg=th["danger_fg"],
+                activebackground=th["danger_active_bg"])
+            self.body.configure(bg=th["folder_bg"])
+        except tk.TclError:
             pass
 
     # ---- 事件 ----
@@ -1684,6 +1879,9 @@ class App(_TK_BASE):
         self.cfg = load_config()
         load_local_font(LOCAL_FONT_FILE)
 
+        # 主题：跟随系统深/浅色（运行时轮询注册表，变了自动切换）
+        self.theme = LIGHT_THEME if system_prefers_light() else DARK_THEME
+
         # _sanitize_config 已经把 window.* 保证为 int 且在合理范围；
         # 但配置里记的 x/y 可能对应已拔掉的显示器坐标（多屏用户）。
         # 用当前主屏尺寸做一次可见性校验：若窗口右下角完全在屏幕外，
@@ -1734,8 +1932,22 @@ class App(_TK_BASE):
         self._save_timer = None
         self._font_apply_timer = None
 
+        # 图标异步提取：worker 线程从 _icon_queue 取任务，
+        # 提取结果放 _icon_results，由主线程定时轮询回填
+        # （不在 worker 里直接碰 tk——tkinter 跨线程调用不安全）
+        self._icon_queue = queue.Queue()
+        self._icon_results = queue.Queue()
+        self._icon_worker = threading.Thread(
+            target=self._icon_worker_main, daemon=True,
+            name="QuickDeckIconWorker")
+        self._icon_worker.start()
+        self.after(120, self._poll_icon_results)
+
         self._build_ui()
         self._apply_style_font()
+        self._apply_style_theme()
+        self._apply_titlebar_dark()
+        self.after(5000, self._poll_theme_change)
 
         if not HAS_WIN32:
             messagebox.showwarning(
@@ -1761,6 +1973,48 @@ class App(_TK_BASE):
             except Exception as e:
                 print(f"[QuickDeck] dnd register failed: {e}",
                       file=sys.stderr)
+
+    # ============================================================
+    # 图标异步提取
+    # ============================================================
+    def request_icon(self, card):
+        """把卡片入队，由 worker 线程提取真实图标。"""
+        self._icon_queue.put(card)
+
+    def _icon_worker_main(self):
+        """worker 线程主循环：提取图标 → 写缓存 → 结果入队。
+        只读 card.path（str，不可变），不触碰任何 tk 对象。"""
+        _ensure_com()  # per-thread COM 初始化（thread-local 记录）
+        while True:
+            card = self._icon_queue.get()
+            if card is None:  # 预留退出信号
+                break
+            try:
+                path = card.path
+                pil = icon_cache_get(path)
+                if pil is None:
+                    pil = get_icon_for_file(path)
+                    if pil is not None:
+                        icon_cache_put(path, pil)
+                if pil is not None:
+                    self._icon_results.put((card, pil))
+            except Exception as e:
+                print(f"[QuickDeck] icon worker error: {e}",
+                      file=sys.stderr)
+
+    def _poll_icon_results(self):
+        """主线程轮询提取结果，回填到仍然存活的卡片上。"""
+        try:
+            while True:
+                card, pil = self._icon_results.get_nowait()
+                try:
+                    if card.winfo_exists():
+                        card.set_extracted_icon(pil)
+                except tk.TclError:
+                    pass  # 卡片已销毁
+        except queue.Empty:
+            pass
+        self.after(120, self._poll_icon_results)
 
     # ============================================================
     # 文件拖放
@@ -1802,17 +2056,24 @@ class App(_TK_BASE):
     # UI 构建
     # ============================================================
     def _build_ui(self):
-        bottom = tk.Frame(self)
+        th = self.theme
+        self.configure(bg=th["app_bg"])
+
+        bottom = tk.Frame(self, bg=th["app_bg"])
         bottom.pack(side="bottom", fill="x")
+        self.bottom_frame = bottom
 
         # 全局字体设置卡片
         font_card = tk.Frame(bottom, bd=1, relief="solid",
-                             padx=8, pady=6, bg="#F8F9FA")
+                             padx=8, pady=6, bg=th["panel_bg"])
         font_card.pack(side="bottom", fill="x", padx=8, pady=(0, 8))
+        self.font_card = font_card
+        self._panel_labels = []
 
-        tk.Label(font_card, text="全局字体：",
-                 font=self.app_font, bg="#F8F9FA"
-                 ).pack(side="left")
+        lbl = tk.Label(font_card, text="全局字体：",
+                       font=self.app_font, bg=th["panel_bg"], fg=th["fg"])
+        lbl.pack(side="left")
+        self._panel_labels.append(lbl)
         self.font_family_var = tk.StringVar(value=self.app_font.cget("family"))
         families = sorted({f for f in tkFont.families() if f.strip()})
         for extra in (BUILTIN_FONT_FAMILY, self.app_font.cget("family")):
@@ -1828,24 +2089,28 @@ class App(_TK_BASE):
         self.font_family_cb.bind("<Return>", self._on_font_change)
         self.font_family_cb.bind("<FocusOut>", self._on_font_change)
 
-        tk.Label(font_card, text="字号：",
-                 font=self.app_font, bg="#F8F9FA"
-                 ).pack(side="left")
+        lbl = tk.Label(font_card, text="字号：",
+                       font=self.app_font, bg=th["panel_bg"], fg=th["fg"])
+        lbl.pack(side="left")
+        self._panel_labels.append(lbl)
         self.font_size_var = tk.StringVar(
             value=str(int(self.app_font.cget("size"))))
         self.font_size_spin = tk.Spinbox(
             font_card, from_=8, to=36, width=5,
             textvariable=self.font_size_var,
-            font=self.app_font, command=self._on_font_change
+            font=self.app_font, command=self._on_font_change,
+            bg=th["desc_bg"], fg=th["fg"], insertbackground=th["fg"],
+            buttonbackground=th["btn_bg"]
         )
         self.font_size_spin.pack(side="left", padx=4)
         self.font_size_spin.bind("<KeyRelease>", self._on_font_change)
         self.font_size_spin.bind("<FocusOut>", self._on_font_change)
 
         # 卡片宽度调节
-        tk.Label(font_card, text="卡片宽度：",
-                 font=self.app_font, bg="#F8F9FA"
-                 ).pack(side="left", padx=(12, 0))
+        lbl = tk.Label(font_card, text="卡片宽度：",
+                       font=self.app_font, bg=th["panel_bg"], fg=th["fg"])
+        lbl.pack(side="left", padx=(12, 0))
+        self._panel_labels.append(lbl)
         self.card_width_var = tk.StringVar(value=str(int(self.card_width)))
         # tk.Spinbox 的箭头默认只在按下瞬间触发一次，长按不连续；
         # 这里保留 Spinbox 作为可键盘输入/单击的入口，但另外把两个自定义
@@ -1854,7 +2119,9 @@ class App(_TK_BASE):
             font_card, from_=200, to=1200, width=6,
             textvariable=self.card_width_var,
             font=self.app_font, command=self._on_card_width_change,
-            increment=1
+            increment=1,
+            bg=th["desc_bg"], fg=th["fg"], insertbackground=th["fg"],
+            buttonbackground=th["btn_bg"]
         )
         self.card_width_spin.pack(side="left", padx=(4, 0))
         self.card_width_spin.bind("<KeyRelease>",
@@ -1867,13 +2134,17 @@ class App(_TK_BASE):
         arrow_up = tk.Button(
             font_card, text="\u25B2",  # ▲
             font=self._make_small_font(), relief="flat", bd=1,
-            padx=2, pady=0, width=2, takefocus=0
+            padx=2, pady=0, width=2, takefocus=0,
+            bg=th["btn_bg"], fg=th["fg"],
+            activebackground=th["btn_active_bg"], activeforeground=th["fg"]
         )
         arrow_up.pack(side="left", padx=(2, 0))
         arrow_dn = tk.Button(
             font_card, text="\u25BC",  # ▼
             font=self._make_small_font(), relief="flat", bd=1,
-            padx=2, pady=0, width=2, takefocus=0
+            padx=2, pady=0, width=2, takefocus=0,
+            bg=th["btn_bg"], fg=th["fg"],
+            activebackground=th["btn_active_bg"], activeforeground=th["fg"]
         )
         arrow_dn.pack(side="left", padx=(2, 0))
         arrow_up.bind("<ButtonPress-1>",
@@ -1888,35 +2159,53 @@ class App(_TK_BASE):
         self.card_width_arrow_dn = arrow_dn
 
         # 工具栏
-        toolbar = tk.Frame(bottom)
+        toolbar = tk.Frame(bottom, bg=th["app_bg"])
         toolbar.pack(side="bottom", fill="x", padx=8, pady=(6, 0))
+        self.toolbar = toolbar
 
         self.add_btn = tk.Button(
             toolbar, text="添加快捷方式",
             font=self.app_font, command=self._on_add,
-            padx=10, pady=4
+            padx=10, pady=4,
+            bg=th["btn_bg"], fg=th["fg"],
+            activebackground=th["btn_active_bg"], activeforeground=th["fg"]
         )
         self.add_btn.pack(side="left")
 
         self.multi_add_btn = tk.Button(
             toolbar, text="多选添加快捷方式",
             font=self.app_font, command=self._on_multi_add,
-            padx=10, pady=4
+            padx=10, pady=4,
+            bg=th["btn_bg"], fg=th["fg"],
+            activebackground=th["btn_active_bg"], activeforeground=th["fg"]
         )
         self.multi_add_btn.pack(side="left", padx=(8, 0))
 
         self.new_folder_btn = tk.Button(
             toolbar, text="新建文件夹",
             font=self.app_font, command=self._on_new_folder,
-            padx=10, pady=4
+            padx=10, pady=4,
+            bg=th["btn_bg"], fg=th["fg"],
+            activebackground=th["btn_active_bg"], activeforeground=th["fg"]
         )
         self.new_folder_btn.pack(side="left", padx=(8, 0))
 
-        # 可滚动列表
-        list_wrap = tk.Frame(self)
-        list_wrap.pack(fill="both", expand=True, padx=8, pady=(8, 0))
+        self.open_dir_btn = tk.Button(
+            toolbar, text="打开程序目录",
+            font=self.app_font, command=self._on_open_app_dir,
+            padx=10, pady=4,
+            bg=th["btn_bg"], fg=th["fg"],
+            activebackground=th["btn_active_bg"], activeforeground=th["fg"]
+        )
+        self.open_dir_btn.pack(side="left", padx=(8, 0))
 
-        self.canvas = tk.Canvas(list_wrap, highlightthickness=0, bg="#F0F0F0")
+        # 可滚动列表
+        list_wrap = tk.Frame(self, bg=th["app_bg"])
+        list_wrap.pack(fill="both", expand=True, padx=8, pady=(8, 0))
+        self.list_wrap = list_wrap
+
+        self.canvas = tk.Canvas(list_wrap, highlightthickness=0,
+                                bg=th["app_bg"])
         self.canvas.pack(side="left", fill="both", expand=True)
 
         self.scrollbar = ttk.Scrollbar(
@@ -1925,7 +2214,7 @@ class App(_TK_BASE):
         self.scrollbar.pack(side="right", fill="y")
         self.canvas.configure(yscrollcommand=self.scrollbar.set)
 
-        self.inner_frame = tk.Frame(self.canvas, bg="#F0F0F0")
+        self.inner_frame = tk.Frame(self.canvas, bg=th["app_bg"])
         self.inner_window = self.canvas.create_window(
             (0, 0), window=self.inner_frame, anchor="nw"
         )
@@ -1949,6 +2238,92 @@ class App(_TK_BASE):
                 self.font_family_cb.configure(font=tup)
             except tk.TclError:
                 pass
+
+    # ============================================================
+    # 主题（深/浅色）
+    # ============================================================
+    def _apply_style_theme(self):
+        """ttk 控件（Combobox / Scrollbar）按当前主题配色。"""
+        th = self.theme
+        try:
+            self.style.configure(
+                "TCombobox",
+                fieldbackground=th["desc_bg"], background=th["btn_bg"],
+                foreground=th["fg"], arrowcolor=th["fg"])
+            self.style.map(
+                "TCombobox",
+                fieldbackground=[("readonly", th["desc_bg"])],
+                foreground=[("readonly", th["fg"])])
+            self.style.configure(
+                "Vertical.TScrollbar",
+                background=th["btn_bg"], troughcolor=th["app_bg"],
+                arrowcolor=th["fg"])
+            # 下拉列表（非 ttk 部分）用 option_add
+            self.option_add("*TCombobox*Listbox.background", th["desc_bg"])
+            self.option_add("*TCombobox*Listbox.foreground", th["fg"])
+        except tk.TclError:
+            pass
+
+    def _apply_titlebar_dark(self):
+        """Windows 10 1809+ / 11：让标题栏跟随深色主题（best-effort）。"""
+        try:
+            self.update_idletasks()
+            hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
+            val = ctypes.c_int(0 if self.theme is LIGHT_THEME else 1)
+            # 20 = DWMWA_USE_IMMERSIVE_DARK_MODE；旧版本 build 用 19
+            for attr in (20, 19):
+                r = ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                    hwnd, attr, ctypes.byref(val), ctypes.sizeof(val))
+                if r == 0:
+                    break
+        except Exception:
+            pass
+
+    def apply_theme(self, theme):
+        """运行时切换整套主题：App 级控件 + 所有 folder + 所有 card。"""
+        self.theme = theme
+        th = theme
+        try:
+            self.configure(bg=th["app_bg"])
+            self.bottom_frame.configure(bg=th["app_bg"])
+            self.toolbar.configure(bg=th["app_bg"])
+            self.list_wrap.configure(bg=th["app_bg"])
+            self.canvas.configure(bg=th["app_bg"])
+            self.inner_frame.configure(bg=th["app_bg"])
+            self.font_card.configure(bg=th["panel_bg"])
+            for lbl in self._panel_labels:
+                lbl.configure(bg=th["panel_bg"], fg=th["fg"])
+            for spin in (self.font_size_spin, self.card_width_spin):
+                spin.configure(bg=th["desc_bg"], fg=th["fg"],
+                               insertbackground=th["fg"],
+                               buttonbackground=th["btn_bg"])
+            for btn in (self.add_btn, self.multi_add_btn,
+                        self.new_folder_btn, self.open_dir_btn,
+                        self.card_width_arrow_up, self.card_width_arrow_dn):
+                btn.configure(bg=th["btn_bg"], fg=th["fg"],
+                              activebackground=th["btn_active_bg"],
+                              activeforeground=th["fg"])
+        except tk.TclError:
+            pass
+        self._apply_style_theme()
+        self._apply_titlebar_dark()
+        for f in self.folders:
+            try:
+                f.apply_theme()
+            except Exception:
+                pass
+        for c in self.all_cards:
+            try:
+                c.apply_theme()
+            except Exception:
+                pass
+
+    def _poll_theme_change(self):
+        """每 5 秒查一次注册表，系统深/浅色变了就实时切换。"""
+        want = LIGHT_THEME if system_prefers_light() else DARK_THEME
+        if want is not self.theme:
+            self.apply_theme(want)
+        self.after(5000, self._poll_theme_change)
 
     # ============================================================
     # Canvas / 滚动
@@ -2002,6 +2377,13 @@ class App(_TK_BASE):
         name = f"新文件夹 {len(self.folders) + 1}"
         self._create_folder(fid, name)
         self.save_state()
+
+    def _on_open_app_dir(self):
+        """打开 QuickDeck 本体（exe / 脚本）所在目录。"""
+        try:
+            os.startfile(APP_DIR)
+        except Exception as e:
+            messagebox.showerror("无法打开目录", f"{APP_DIR}\n\n{e}")
 
     def delete_folder(self, folder):
         if len(self.folders) <= 1:
