@@ -121,6 +121,7 @@ DEFAULT_CONFIG = {
     "window": {"width": 900, "height": 650, "x": 200, "y": 100},
     "font": {"family": BUILTIN_FONT_FAMILY, "size": 12},
     "card_width": 500,
+    "theme_mode": "system",  # "system" | "light" | "dark"
     "shortcuts": []
 }
 
@@ -284,6 +285,12 @@ def _sanitize_config(cfg):
         lo=200, hi=1200
     )
 
+    # ---- theme_mode ----
+    tm = cfg.get("theme_mode")
+    if tm not in ("system", "light", "dark"):
+        tm = "system"
+    cfg["theme_mode"] = tm
+
     # ---- folders ----
     raw_folders = cfg.get("folders")
     clean_folders = []
@@ -299,9 +306,11 @@ def _sanitize_config(cfg):
                 name = "未命名"
             order = _int_or(i, fd.get("order"), lo=-10**9, hi=10**9)
             locked = bool(fd.get("locked"))
+            collapsed = bool(fd.get("collapsed"))
             clean_folders.append({
                 "id": fid, "name": name,
                 "order": order, "locked": locked,
+                "collapsed": collapsed,
             })
     cfg["folders"] = clean_folders  # 允许为空，_load_from_config 会兜底建默认
 
@@ -1595,6 +1604,7 @@ class FolderFrame(tk.Frame):
         self.cards = []
         self._num_cols = 1
         self.locked = False  # 上锁时禁用名字编辑 / 卡片编辑 / 卡片拖拽 / 删除
+        self.collapsed = False  # 折叠时隐藏卡片区（body），header 保留；与 locked 相互独立
 
         # ---- header（紧凑：小 padding，无冗余空间） ----
         header = tk.Frame(self, bg=th["header_bg"], padx=4, pady=1)
@@ -1635,6 +1645,18 @@ class FolderFrame(tk.Frame):
             command=self._on_toggle_lock
         )
         self.lock_btn.pack(side="right", padx=(0, 2))
+
+        # 折叠按钮：▾（展开中，点击收起）/ ▸（已收起，点击展开）；
+        # 收起时隐藏整个卡片区（body），header 保留。与锁定相互独立。
+        self.collapse_btn = tk.Button(
+            header, text="\u25BE",  # ▾
+            font=self._header_font, relief="flat", bd=0,
+            bg=th["header_bg"], fg=th["header_fg"],
+            activebackground=th["header_active_bg"],
+            padx=4, pady=0,
+            command=self._on_toggle_collapse
+        )
+        self.collapse_btn.pack(side="right", padx=(0, 2))
 
         # 用小号 ✕ 按钮替代原来的"删除文件夹"文本按钮，
         # 让 header 高度显著变矮；保留同样的悬停危险色反馈
@@ -1681,6 +1703,9 @@ class FolderFrame(tk.Frame):
                 insertbackground=th["fg"],
                 readonlybackground=th["header_bg"])
             self.lock_btn.configure(
+                bg=th["header_bg"], fg=th["header_fg"],
+                activebackground=th["header_active_bg"])
+            self.collapse_btn.configure(
                 bg=th["header_bg"], fg=th["header_fg"],
                 activebackground=th["header_active_bg"])
             self.del_btn.configure(
@@ -1741,6 +1766,34 @@ class FolderFrame(tk.Frame):
         for c in self.cards:
             try:
                 c.apply_lock_state(self.locked)
+            except Exception:
+                pass
+
+    def _on_toggle_collapse(self):
+        self.set_collapsed(not self.collapsed)
+        self.app.save_state()
+
+    def set_collapsed(self, collapsed):
+        """折叠/展开卡片区。header（含名字/锁/删除按钮）始终保留。"""
+        self.collapsed = bool(collapsed)
+        try:
+            self.collapse_btn.configure(
+                text="\u25B8" if self.collapsed else "\u25BE")  # ▸ / ▾
+        except Exception:
+            pass
+        if self.collapsed:
+            try:
+                self.body.pack_forget()
+            except Exception:
+                pass
+        else:
+            try:
+                self.body.pack(fill="both", expand=True)
+            except Exception:
+                pass
+            # 展开后重排一次，保证卡片布局/列数与当前宽度一致
+            try:
+                self._reflow()
             except Exception:
                 pass
 
@@ -1879,8 +1932,9 @@ class App(_TK_BASE):
         self.cfg = load_config()
         load_local_font(LOCAL_FONT_FILE)
 
-        # 主题：跟随系统深/浅色（运行时轮询注册表，变了自动切换）
-        self.theme = LIGHT_THEME if system_prefers_light() else DARK_THEME
+        # 主题模式：system（跟随系统，轮询注册表）/ light / dark（固定）
+        self.theme_mode = self.cfg.get("theme_mode", "system")
+        self.theme = self._resolve_theme()
 
         # _sanitize_config 已经把 window.* 保证为 int 且在合理范围；
         # 但配置里记的 x/y 可能对应已拔掉的显示器坐标（多屏用户）。
@@ -2158,6 +2212,26 @@ class App(_TK_BASE):
         self.card_width_arrow_up = arrow_up
         self.card_width_arrow_dn = arrow_dn
 
+        # 主题模式选择（浅色 / 深色 / 跟随系统）
+        lbl = tk.Label(font_card, text="主题：",
+                       font=self.app_font, bg=th["panel_bg"], fg=th["fg"])
+        lbl.pack(side="left", padx=(12, 0))
+        self._panel_labels.append(lbl)
+        self._THEME_MODE_LABELS = {
+            "system": "跟随系统", "light": "浅色", "dark": "深色"}
+        self._THEME_MODE_BY_LABEL = {
+            v: k for k, v in self._THEME_MODE_LABELS.items()}
+        self.theme_mode_var = tk.StringVar(
+            value=self._THEME_MODE_LABELS.get(self.theme_mode, "跟随系统"))
+        self.theme_mode_cb = ttk.Combobox(
+            font_card, textvariable=self.theme_mode_var,
+            values=["跟随系统", "浅色", "深色"],
+            state="readonly", width=8
+        )
+        self.theme_mode_cb.pack(side="left", padx=(4, 0))
+        self.theme_mode_cb.bind("<<ComboboxSelected>>",
+                                self._on_theme_mode_change)
+
         # 工具栏
         toolbar = tk.Frame(bottom, bg=th["app_bg"])
         toolbar.pack(side="bottom", fill="x", padx=8, pady=(6, 0))
@@ -2318,11 +2392,31 @@ class App(_TK_BASE):
             except Exception:
                 pass
 
-    def _poll_theme_change(self):
-        """每 5 秒查一次注册表，系统深/浅色变了就实时切换。"""
-        want = LIGHT_THEME if system_prefers_light() else DARK_THEME
+    def _resolve_theme(self):
+        """按当前 theme_mode 解析出应使用的主题 dict。"""
+        if self.theme_mode == "light":
+            return LIGHT_THEME
+        if self.theme_mode == "dark":
+            return DARK_THEME
+        return LIGHT_THEME if system_prefers_light() else DARK_THEME
+
+    def _on_theme_mode_change(self, event=None):
+        mode = self._THEME_MODE_BY_LABEL.get(
+            self.theme_mode_var.get(), "system")
+        if mode == self.theme_mode:
+            return
+        self.theme_mode = mode
+        want = self._resolve_theme()
         if want is not self.theme:
             self.apply_theme(want)
+        self.save_state()  # 主题没变也要把模式选择持久化
+
+    def _poll_theme_change(self):
+        """每 5 秒查一次注册表；仅"跟随系统"模式下响应系统深/浅色变化。"""
+        if self.theme_mode == "system":
+            want = self._resolve_theme()
+            if want is not self.theme:
+                self.apply_theme(want)
         self.after(5000, self._poll_theme_change)
 
     # ============================================================
@@ -2536,6 +2630,12 @@ class App(_TK_BASE):
                     f.set_locked(True)
                 except Exception:
                     pass
+            # 恢复折叠态（与锁定相互独立）
+            if fd.get("collapsed"):
+                try:
+                    f.set_collapsed(True)
+                except Exception:
+                    pass
 
         items = self.cfg.get("shortcuts") or []
         items = sorted(
@@ -2678,6 +2778,10 @@ class App(_TK_BASE):
         x, y = event.x_root, event.y_root
         target_folder = self._folder_at_y(y)
         if target_folder is None:
+            return
+        # 折叠的文件夹卡片区不可见，不作为拖拽落点（避免卡片"拖进去就消失"）
+        if getattr(target_folder, "collapsed", False) \
+                and target_folder is not card.folder:
             return
         target_pos = self._insert_position_in_folder(target_folder, x, y, card)
         self._move_card_to(card, target_folder, target_pos)
@@ -2849,9 +2953,11 @@ class App(_TK_BASE):
             "size": int(self.app_font.cget("size"))
         }
         self.cfg["card_width"] = int(self.card_width)
+        self.cfg["theme_mode"] = self.theme_mode
         self.cfg["folders"] = [
             {"id": f.id, "name": f.name, "order": i,
-             "locked": bool(getattr(f, "locked", False))}
+             "locked": bool(getattr(f, "locked", False)),
+             "collapsed": bool(getattr(f, "collapsed", False))}
             for i, f in enumerate(self.folders)
         ]
         shortcuts = []
