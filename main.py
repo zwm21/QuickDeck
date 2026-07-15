@@ -1928,6 +1928,10 @@ class App(_TK_BASE):
     def __init__(self):
         super().__init__()
         self.title("QuickDeck")
+        # 构建/加载期间隐藏窗口。_create_folder 里的 update() 会把事件循环
+        # 整个跑一遍，若窗口此时可见就会把"卡片还堆在 1 列、宽度未分配"的
+        # 中间态画出来（启动时闪现条状画面的根因）。全部就绪后再 deiconify。
+        self.withdraw()
 
         self.cfg = load_config()
         load_local_font(LOCAL_FONT_FILE)
@@ -2027,6 +2031,14 @@ class App(_TK_BASE):
             except Exception as e:
                 print(f"[QuickDeck] dnd register failed: {e}",
                       file=sys.stderr)
+
+        # 与开头的 withdraw 配对：先结清所有挂起的几何计算，
+        # 保证显示出来的第一帧就是完整布局
+        try:
+            self.update_idletasks()
+        except Exception:
+            pass
+        self.deiconify()
 
     # ============================================================
     # 图标异步提取
@@ -2339,16 +2351,27 @@ class App(_TK_BASE):
             pass
 
     def _apply_titlebar_dark(self):
-        """Windows 10 1809+ / 11：让标题栏跟随深色主题（best-effort）。"""
+        """Windows 10 1809+ / 11：让标题栏跟随深色主题（best-effort）。
+
+        只在目标值与上次实际写入的值不同时才调用 DWM。浅色是系统默认，
+        从未进过深色就完全不碰该属性——Win11 上给窗口写过
+        DWMWA_USE_IMMERSIVE_DARK_MODE（即使值为 0）后，窗口会走深浅色
+        感知的合成路径，最小化恢复时未完成重绘的区域会先被合成为黑色
+        （浅色模式下"卡片间隙黑边一闪"的根因）。
+        """
+        want = 0 if self.theme is LIGHT_THEME else 1
+        if want == getattr(self, "_titlebar_dark_val", 0):
+            return
         try:
             self.update_idletasks()
             hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
-            val = ctypes.c_int(0 if self.theme is LIGHT_THEME else 1)
+            val = ctypes.c_int(want)
             # 20 = DWMWA_USE_IMMERSIVE_DARK_MODE；旧版本 build 用 19
             for attr in (20, 19):
                 r = ctypes.windll.dwmapi.DwmSetWindowAttribute(
                     hwnd, attr, ctypes.byref(val), ctypes.sizeof(val))
                 if r == 0:
+                    self._titlebar_dark_val = want
                     break
         except Exception:
             pass
