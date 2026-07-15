@@ -13,8 +13,17 @@ import json
 import copy
 import uuid
 import ctypes
+import subprocess
 import tkinter as tk
-from tkinter import ttk, font as tkFont, filedialog, messagebox
+from tkinter import ttk, font as tkFont, filedialog, messagebox, simpledialog
+
+# ---- 可选依赖：tkinterdnd2（文件拖放进窗口） --------------------
+# 缺失时程序正常运行，只是没有"从资源管理器拖文件进来"的能力。
+try:
+    from tkinterdnd2 import TkinterDnD, DND_FILES
+    HAS_DND = True
+except ImportError:
+    HAS_DND = False
 
 # ---- 可选依赖：pywin32 + Pillow ----------------------------------
 # 若缺失，程序仍能启动，但会禁用图标提取与添加功能，并弹窗提示。
@@ -55,6 +64,48 @@ def _resource_path(name):
 
 
 CONFIG_FILE = os.path.join(APP_DIR, "config.json")
+
+# APPDATA 兜底目录（exe 目录写不进时用，如装在 Program Files 的场景）
+APPDATA_DIR = os.path.join(
+    os.environ.get("APPDATA") or os.path.expanduser("~"), "QuickDeck"
+)
+APPDATA_CONFIG_FILE = os.path.join(APPDATA_DIR, "config.json")
+
+
+def _dir_writable(d):
+    """探测目录是否真的可写（Program Files 下 os.access 不可靠）。"""
+    try:
+        probe = os.path.join(d, ".qd_write_test")
+        with open(probe, "w") as f:
+            f.write("x")
+        os.remove(probe)
+        return True
+    except OSError:
+        return False
+
+
+def _select_config_file():
+    """Portable 优先：exe 目录存在 config.json 或目录可写 → 用 exe 目录；
+    否则降级到 %APPDATA%/QuickDeck/config.json。"""
+    # 两处都存在时优先 exe 目录（Portable 语义）
+    if os.path.exists(CONFIG_FILE):
+        return CONFIG_FILE
+    if os.path.exists(APPDATA_CONFIG_FILE):
+        # exe 目录没有配置但 APPDATA 有 → 曾经降级过，继续用 APPDATA
+        return APPDATA_CONFIG_FILE
+    # 都不存在：首次运行，按可写性决定落点
+    if _dir_writable(APP_DIR):
+        return CONFIG_FILE
+    try:
+        os.makedirs(APPDATA_DIR, exist_ok=True)
+    except OSError:
+        pass
+    return APPDATA_CONFIG_FILE
+
+
+# ACTIVE_CONFIG_FILE 是本次运行实际使用的配置路径；save_config 写失败时
+# 会自动切到 APPDATA 再试一次并更新它
+ACTIVE_CONFIG_FILE = _select_config_file()
 LOCAL_FONT_FILE = _resource_path("HYWenHei-65W.ttf")
 
 # 内置字体家族名（TTF 文件内 name table 记录的家族名，
@@ -90,9 +141,15 @@ def enable_dpi_awareness():
 # ================================================================
 # 配置读写
 # ================================================================
-CONFIG_BAK_FILE = CONFIG_FILE + ".bak"
-CONFIG_TMP_FILE = CONFIG_FILE + ".tmp"
-CONFIG_CORRUPT_FILE = CONFIG_FILE + ".corrupt"
+def _cfg_paths(cfg_file):
+    """由主配置路径派生 bak/tmp/corrupt 三个伴生路径。"""
+    return cfg_file + ".bak", cfg_file + ".tmp", cfg_file + ".corrupt"
+
+
+# 兼容旧引用（基于启动时选中的路径；save_config 降级后以
+# ACTIVE_CONFIG_FILE 的派生为准）
+CONFIG_BAK_FILE, CONFIG_TMP_FILE, CONFIG_CORRUPT_FILE = \
+    _cfg_paths(ACTIVE_CONFIG_FILE)
 
 # _merge_dict 允许的最大递归深度：正常配置最多 3-4 层嵌套，
 # 32 层已远超合理值；超过即视为恶意构造或损坏，停止递归以防栈溢出。
@@ -209,9 +266,16 @@ def _sanitize_config(cfg):
             if not isinstance(fid, str) or not fid:
                 fid = ""
             order = _int_or(i, it.get("order"), lo=-10**9, hi=10**9)
+            title = it.get("title", "")
+            if not isinstance(title, str):
+                title = ""
+            icon = it.get("icon", "")
+            if not isinstance(icon, str):
+                icon = ""
             clean_items.append({
                 "path": p, "description": desc,
                 "folder": fid, "order": order,
+                "title": title, "icon": icon,
             })
     cfg["shortcuts"] = clean_items
 
@@ -230,25 +294,28 @@ def _read_config_file(path):
 
 
 def load_config():
-    """从 config.json 加载配置。
+    """从 ACTIVE_CONFIG_FILE 加载配置。
 
     - 文件不存在：返回默认。
-    - 加载失败：先隔离坏文件到 config.json.corrupt，再尝试 .bak；
+    - 加载失败：先隔离坏文件到 *.corrupt，再尝试 .bak；
       两个都不行时用 messagebox 让用户在"备份坏文件并使用默认" /
       "退出程序检查文件" 之间选择，避免下次 save 无声覆盖坏数据。
     """
-    if not os.path.exists(CONFIG_FILE):
+    cfg_file = ACTIVE_CONFIG_FILE
+    bak_file, _tmp, corrupt_file = _cfg_paths(cfg_file)
+
+    if not os.path.exists(cfg_file):
         # 主文件缺失但有 .bak，尝试恢复
-        if os.path.exists(CONFIG_BAK_FILE):
+        if os.path.exists(bak_file):
             try:
-                return _read_config_file(CONFIG_BAK_FILE)
+                return _read_config_file(bak_file)
             except Exception as e:
                 print(f"[QuickDeck] load bak fallback failed: {e}",
                       file=sys.stderr)
         return _sanitize_config(copy.deepcopy(DEFAULT_CONFIG))
 
     try:
-        return _read_config_file(CONFIG_FILE)
+        return _read_config_file(cfg_file)
     except Exception as primary_err:
         print(f"[QuickDeck] load_config primary error: {primary_err}",
               file=sys.stderr)
@@ -256,9 +323,9 @@ def load_config():
     # 主文件读取失败：尝试 .bak
     bak_cfg = None
     bak_err = None
-    if os.path.exists(CONFIG_BAK_FILE):
+    if os.path.exists(bak_file):
         try:
-            bak_cfg = _read_config_file(CONFIG_BAK_FILE)
+            bak_cfg = _read_config_file(bak_file)
         except Exception as e:
             bak_err = e
             print(f"[QuickDeck] load_config bak error: {e}",
@@ -267,7 +334,7 @@ def load_config():
     # 有可用 .bak：把损坏主文件挪走 → 用 .bak 覆盖 → 使用 .bak
     if bak_cfg is not None:
         try:
-            os.replace(CONFIG_FILE, CONFIG_CORRUPT_FILE)
+            os.replace(cfg_file, corrupt_file)
         except Exception:
             pass
         # 弹窗告知，避免用户以为一切正常
@@ -296,48 +363,75 @@ def load_config():
     if not choice:
         sys.exit(1)
     try:
-        os.replace(CONFIG_FILE, CONFIG_CORRUPT_FILE)
+        os.replace(cfg_file, corrupt_file)
     except Exception:
         pass
     return _sanitize_config(copy.deepcopy(DEFAULT_CONFIG))
 
 
-def save_config(cfg):
-    """原子写回 config.json。
-
-    步骤：
-      1. 写 config.json.tmp（fsync 落盘）
-      2. 用 os.replace 原子替换 config.json；替换前把旧主文件
-         另存为 config.json.bak，保留一次可回滚的历史
-    出错保留旧 config.json 不被破坏。
-    """
-    try:
-        # 1) 写临时文件；先 flush + fsync 保证内容真的到磁盘再 rename
-        with open(CONFIG_TMP_FILE, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, ensure_ascii=False, indent=2)
-            try:
-                f.flush()
-                os.fsync(f.fileno())
-            except (OSError, AttributeError):
-                pass
-
-        # 2) 先把当前主文件挪到 .bak（保留上次成功的完整版本），
-        #    然后把 tmp 原子替换为主文件
-        if os.path.exists(CONFIG_FILE):
-            try:
-                os.replace(CONFIG_FILE, CONFIG_BAK_FILE)
-            except OSError as e:
-                print(f"[QuickDeck] backup rotate failed: {e}",
-                      file=sys.stderr)
-        os.replace(CONFIG_TMP_FILE, CONFIG_FILE)
-    except Exception as e:
-        print(f"[QuickDeck] save_config error: {e}", file=sys.stderr)
-        # 清理可能残留的 tmp，避免下次干扰
+def _write_config_to(cfg, cfg_file):
+    """把 cfg 原子写到 cfg_file（tmp + fsync + os.replace + bak 轮转）。
+    失败时抛异常（由 save_config 决定是否降级重试）。"""
+    bak_file, tmp_file, _corrupt = _cfg_paths(cfg_file)
+    d = os.path.dirname(cfg_file)
+    if d and not os.path.isdir(d):
+        os.makedirs(d, exist_ok=True)
+    # 1) 写临时文件；先 flush + fsync 保证内容真的到磁盘再 rename
+    with open(tmp_file, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
         try:
-            if os.path.exists(CONFIG_TMP_FILE):
-                os.remove(CONFIG_TMP_FILE)
+            f.flush()
+            os.fsync(f.fileno())
+        except (OSError, AttributeError):
+            pass
+    # 2) 先把当前主文件挪到 .bak（保留上次成功的完整版本），
+    #    然后把 tmp 原子替换为主文件
+    if os.path.exists(cfg_file):
+        try:
+            os.replace(cfg_file, bak_file)
+        except OSError as e:
+            print(f"[QuickDeck] backup rotate failed: {e}",
+                  file=sys.stderr)
+    os.replace(tmp_file, cfg_file)
+
+
+def save_config(cfg):
+    """原子写回配置。
+
+    Portable 优先：先写 ACTIVE_CONFIG_FILE（初始为 exe 目录，除非启动时
+    已降级）。写失败（如 exe 在 Program Files、权限不足）时自动降级到
+    %APPDATA%/QuickDeck/config.json 再试一次，并把 ACTIVE_CONFIG_FILE
+    永久切过去，本次会话后续保存都直接走 APPDATA。
+    """
+    global ACTIVE_CONFIG_FILE
+    try:
+        _write_config_to(cfg, ACTIVE_CONFIG_FILE)
+        return
+    except Exception as e:
+        print(f"[QuickDeck] save_config error at "
+              f"{ACTIVE_CONFIG_FILE}: {e}", file=sys.stderr)
+        # 清理可能残留的 tmp，避免下次干扰
+        _b, tmp_file, _c = _cfg_paths(ACTIVE_CONFIG_FILE)
+        try:
+            if os.path.exists(tmp_file):
+                os.remove(tmp_file)
         except OSError:
             pass
+
+    # 已经在 APPDATA 还失败：没有更低的降级层，放弃本次保存
+    if os.path.normcase(ACTIVE_CONFIG_FILE) == \
+            os.path.normcase(APPDATA_CONFIG_FILE):
+        return
+
+    # 降级 APPDATA 重试
+    try:
+        _write_config_to(cfg, APPDATA_CONFIG_FILE)
+        ACTIVE_CONFIG_FILE = APPDATA_CONFIG_FILE
+        print(f"[QuickDeck] config fell back to {APPDATA_CONFIG_FILE}",
+              file=sys.stderr)
+    except Exception as e:
+        print(f"[QuickDeck] save_config appdata fallback error: {e}",
+              file=sys.stderr)
 
 
 # ================================================================
@@ -1063,15 +1157,22 @@ class ShortcutCard(tk.Frame):
     # 兼容旧引用；实际生效值走 App.card_width（可由 UI 实时调整）
     CARD_WIDTH = 500
 
-    def __init__(self, master, app, path, description=""):
+    def __init__(self, master, app, path, description="",
+                 custom_title="", custom_icon=""):
         super().__init__(master, bd=1, relief="solid",
                          padx=8, pady=6, bg="#FFFFFF")
         self.app = app
         self.path = path
         self.folder = None  # 由 FolderFrame.add_card / insert_card 设置
+        self.custom_title = custom_title or ""
+        self.custom_icon = custom_icon or ""
 
-        # 图标
-        pil = get_icon_for_file(path) if HAS_WIN32 else None
+        # 图标（优先自定义图标文件，失败回落到自动提取）
+        pil = None
+        if self.custom_icon:
+            pil = self._load_icon_file(self.custom_icon)
+        if pil is None and HAS_WIN32:
+            pil = get_icon_for_file(path)
         if pil is None:
             pil = app.default_icon_img
         self.icon_pil = pil
@@ -1083,8 +1184,9 @@ class ShortcutCard(tk.Frame):
 
         mid = tk.Frame(self, bg="#FFFFFF")
         mid.pack(side="left", fill="both", expand=True)
+        self.mid = mid
 
-        title_text = get_title_for_file(path)
+        title_text = self.custom_title or get_title_for_file(path)
         self.title_label = tk.Label(mid, text=title_text, anchor="w",
                                     font=app.app_font, bg="#FFFFFF",
                                     cursor="fleur")
@@ -1113,6 +1215,141 @@ class ShortcutCard(tk.Frame):
             w.bind("<B1-Motion>", self._on_drag_motion)
             w.bind("<ButtonRelease-1>", self._on_drag_end)
             w.bind("<Double-Button-1>", self._on_double_click)
+            w.bind("<Button-3>", self._on_right_click)
+
+    # ---- 自定义图标 ----
+    @staticmethod
+    def _load_icon_file(icon_path):
+        """从 .ico/.png/.jpg 等图像文件加载卡片图标；失败返回 None。"""
+        try:
+            if not icon_path or not os.path.exists(icon_path):
+                return None
+            img = Image.open(icon_path)
+            if img.mode != "RGBA":
+                img = img.convert("RGBA")
+            img = img.resize((ICON_SIZE, ICON_SIZE), Image.LANCZOS)
+            return img
+        except Exception as e:
+            print(f"[QuickDeck] load custom icon failed: {e}",
+                  file=sys.stderr)
+            return None
+
+    def set_custom_icon(self, icon_path):
+        """替换图标；icon_path 为空字符串时恢复自动提取。"""
+        pil = None
+        if icon_path:
+            pil = self._load_icon_file(icon_path)
+            if pil is None:
+                messagebox.showwarning(
+                    "替换图标失败", f"无法读取图像文件：\n{icon_path}")
+                return False
+        if pil is None and HAS_WIN32:
+            pil = get_icon_for_file(self.path)
+        if pil is None:
+            pil = self.app.default_icon_img
+        self.custom_icon = icon_path or ""
+        self.icon_pil = pil
+        self.icon_photo = ImageTk.PhotoImage(pil)
+        self.icon_label.configure(image=self.icon_photo)
+        return True
+
+    def set_custom_title(self, title):
+        """重命名标题；title 为空时恢复文件名默认标题。"""
+        self.custom_title = (title or "").strip()
+        self.title_label.configure(
+            text=self.custom_title or get_title_for_file(self.path))
+
+    # ---- 右键菜单 ----
+    def _on_right_click(self, e):
+        menu = tk.Menu(self, tearoff=0, font=self.app.app_font)
+        locked = (self.folder is not None
+                  and getattr(self.folder, "locked", False))
+        state = "disabled" if locked else "normal"
+        menu.add_command(label="重命名标题",
+                         command=self._menu_rename, state=state)
+        menu.add_command(label="替换图标",
+                         command=self._menu_change_icon, state=state)
+        menu.add_command(label="编辑描述",
+                         command=self._menu_edit_desc, state=state)
+        menu.add_separator()
+        # 移动到指定文件夹（锁定时禁止移出）
+        move_menu = tk.Menu(menu, tearoff=0, font=self.app.app_font)
+        for f in self.app.folders:
+            if f is self.folder:
+                continue
+            # 目标 folder 上锁的也不作为落点
+            item_state = "disabled" if (locked or f.locked) else "normal"
+            move_menu.add_command(
+                label=f.name, state=item_state,
+                command=lambda tf=f: self.app.move_card_to_folder(self, tf))
+        menu.add_cascade(label="移动到文件夹", menu=move_menu,
+                         state=state if len(self.app.folders) > 1
+                         else "disabled")
+        menu.add_separator()
+        menu.add_command(label="打开文件所在位置",
+                         command=self._menu_open_location)
+        menu.add_command(label="复制路径", command=self._menu_copy_path)
+        menu.add_separator()
+        menu.add_command(label="删除卡片", state=state,
+                         command=self._on_delete)
+        try:
+            menu.tk_popup(e.x_root, e.y_root)
+        finally:
+            menu.grab_release()
+
+    def _menu_rename(self):
+        cur = self.custom_title or get_title_for_file(self.path)
+        new = simpledialog.askstring(
+            "重命名标题", "新标题（留空恢复文件名默认标题）：",
+            initialvalue=cur, parent=self.app)
+        if new is None:
+            return  # 用户取消
+        self.set_custom_title(new)
+        self.app.save_state()
+
+    def _menu_change_icon(self):
+        p = filedialog.askopenfilename(
+            title="选择图标图像",
+            filetypes=[("图像文件", "*.ico;*.png;*.jpg;*.jpeg;*.bmp;*.gif"),
+                       ("所有文件", "*.*")],
+            parent=self.app)
+        if not p:
+            return
+        if self.set_custom_icon(p):
+            self.app.save_state()
+
+    def _menu_edit_desc(self):
+        new = simpledialog.askstring(
+            "编辑描述", "描述：",
+            initialvalue=self.desc_var.get(), parent=self.app)
+        if new is None:
+            return
+        self.desc_var.set(new)
+        self.app.save_state()
+
+    def _menu_open_location(self):
+        """在资源管理器中打开文件所在位置并选中该文件。"""
+        p = self.path
+        try:
+            if os.path.exists(p):
+                subprocess.Popen(
+                    ["explorer", "/select,", os.path.normpath(p)])
+            else:
+                d = os.path.dirname(p)
+                if os.path.isdir(d):
+                    os.startfile(d)
+                else:
+                    messagebox.showwarning(
+                        "无法打开", f"文件和所在目录都不存在：\n{p}")
+        except Exception as e:
+            messagebox.showerror("无法打开位置", f"{p}\n\n{e}")
+
+    def _menu_copy_path(self):
+        try:
+            self.app.clipboard_clear()
+            self.app.clipboard_append(self.path)
+        except Exception:
+            pass
 
     def _on_delete(self):
         # 所属文件夹上锁时禁止删除
@@ -1425,7 +1662,12 @@ class FolderFrame(tk.Frame):
 # ================================================================
 # 主应用窗口
 # ================================================================
-class App(tk.Tk):
+# tkinterdnd2 可用时用 TkinterDnD.Tk 作基类（在 tk 解释器里加载 tkdnd
+# 扩展，OLE 文件拖放才能生效）；缺失则回退 tk.Tk，功能自动禁用
+_TK_BASE = TkinterDnD.Tk if HAS_DND else tk.Tk
+
+
+class App(_TK_BASE):
     """QuickDeck 主窗口。
     数据模型：
       self.folders: List[FolderFrame]
@@ -1510,6 +1752,38 @@ class App(tk.Tk):
 
         self.bind("<Configure>", self._on_window_configure)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # 文件拖放进窗口即添加（tkinterdnd2 可用且 win32 功能未禁用时）
+        if HAS_DND and HAS_WIN32:
+            try:
+                self.drop_target_register(DND_FILES)
+                self.dnd_bind("<<Drop>>", self._on_file_drop)
+            except Exception as e:
+                print(f"[QuickDeck] dnd register failed: {e}",
+                      file=sys.stderr)
+
+    # ============================================================
+    # 文件拖放
+    # ============================================================
+    def _on_file_drop(self, event):
+        """资源管理器拖文件到窗口：逐个添加到最后一个文件夹。"""
+        try:
+            # event.data 是 Tcl 列表格式，含空格路径会被 {} 包住
+            paths = self.tk.splitlist(event.data)
+        except Exception:
+            return
+        target = self.folders[-1] if self.folders else None
+        added = 0
+        for p in paths:
+            if not p:
+                continue
+            # 目录不收（拖文件夹进来通常是误操作；快捷方式管理器管文件）
+            if os.path.isdir(p):
+                continue
+            if self._add_card(p, "", folder=target):
+                added += 1
+        if added:
+            self.save_state()
 
     # ============================================================
     # 便捷 accessors
@@ -1736,6 +2010,16 @@ class App(tk.Tk):
         # 卡片转移到最后一个剩余文件夹的末尾（"所有卡片队列末尾"）
         remaining = [f for f in self.folders if f is not folder]
         target = remaining[-1] if remaining else None
+        # 删除前确认，说明后果（卡片不会丢，但会被移走）
+        n = len(folder.cards)
+        if n > 0 and target is not None:
+            msg = (f"确定删除文件夹「{folder.name}」？\n\n"
+                   f"其中的 {n} 张快捷方式卡片不会被删除，"
+                   f"会移动到文件夹「{target.name}」的末尾。")
+        else:
+            msg = f"确定删除空文件夹「{folder.name}」？"
+        if not messagebox.askyesno("删除文件夹", msg):
+            return
         moved = list(folder.cards)
         folder.cards = []  # 清空源文件夹，但不销毁卡片本身
         if target is not None:
@@ -1796,7 +2080,8 @@ class App(tk.Tk):
         norm = self._normalize_path(path)
         return any(self._normalize_path(c.path) == norm for c in self.all_cards)
 
-    def _add_card(self, path, description, folder=None):
+    def _add_card(self, path, description, folder=None,
+                  custom_title="", custom_icon=""):
         """添加卡片；重复路径安静跳过。默认加到最后一个文件夹的末尾。"""
         if self._has_card_with_path(path):
             return False
@@ -1805,12 +2090,24 @@ class App(tk.Tk):
                 self._create_folder(self.DEFAULT_FOLDER_ID, "默认")
             folder = self.folders[-1]
         try:
-            card = ShortcutCard(self.inner_frame, self, path, description)
+            card = ShortcutCard(self.inner_frame, self, path, description,
+                                custom_title=custom_title,
+                                custom_icon=custom_icon)
         except Exception as e:
             print(f"[QuickDeck] add_card error: {e}", file=sys.stderr)
             return False
         folder.add_card(card)
         return True
+
+    def move_card_to_folder(self, card, target_folder):
+        """右键菜单"移动到文件夹"：追加到目标 folder 末尾。"""
+        if card.folder is target_folder:
+            return
+        if getattr(card.folder, "locked", False) \
+                or getattr(target_folder, "locked", False):
+            return
+        self._move_card_to(card, target_folder, len(target_folder.cards))
+        self.save_state()
 
     def remove_card(self, card):
         folder = card.folder
@@ -1870,7 +2167,9 @@ class App(tk.Tk):
                 continue
             fid = it.get("folder") or self.DEFAULT_FOLDER_ID
             target = self.folder_by_id(fid) or self.folders[0]
-            self._add_card(p, it.get("description", ""), folder=target)
+            self._add_card(p, it.get("description", ""), folder=target,
+                           custom_title=it.get("title", ""),
+                           custom_icon=it.get("icon", ""))
 
     # ============================================================
     # 字体切换
@@ -2180,7 +2479,9 @@ class App(tk.Tk):
                     "path": c.path,
                     "description": c.desc_var.get(),
                     "folder": f.id,
-                    "order": j
+                    "order": j,
+                    "title": getattr(c, "custom_title", "") or "",
+                    "icon": getattr(c, "custom_icon", "") or ""
                 })
         self.cfg["shortcuts"] = shortcuts
         save_config(self.cfg)

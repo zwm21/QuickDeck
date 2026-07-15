@@ -39,6 +39,13 @@ if errorlevel 1 (
     if errorlevel 1 goto :fail
 )
 
+python -m pip show tkinterdnd2 >nul 2>&1
+if errorlevel 1 (
+    echo    Installing tkinterdnd2 ...
+    python -m pip install tkinterdnd2
+    if errorlevel 1 goto :fail
+)
+
 REM ---- Clean previous build output ----
 echo [2/4] Cleaning old build output ...
 if exist build rmdir /s /q build
@@ -53,7 +60,7 @@ if not exist "HYWenHei-65W.ttf" (
 
 REM ---- Run PyInstaller (single line, no caret line-continuation) ----
 echo [3/4] Packaging ... this may take 1-3 minutes.
-python -m PyInstaller --noconfirm --clean --onefile --windowed --name QuickDeck --add-data "HYWenHei-65W.ttf;." --hidden-import win32com --hidden-import win32com.client --hidden-import win32gui --hidden-import win32ui --hidden-import win32con main.py
+python -m PyInstaller --noconfirm --clean --onefile --windowed --name QuickDeck --add-data "HYWenHei-65W.ttf;." --hidden-import win32com --hidden-import win32com.client --hidden-import win32gui --hidden-import win32ui --hidden-import win32con --collect-all tkinterdnd2 main.py
 if errorlevel 1 goto :fail
 
 REM ---- Done ----
