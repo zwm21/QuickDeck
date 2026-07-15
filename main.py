@@ -2005,6 +2005,7 @@ class App(_TK_BASE):
         self._apply_style_font()
         self._apply_style_theme()
         self._apply_titlebar_dark()
+        self._apply_class_bg_brush()
         self.after(5000, self._poll_theme_change)
 
         if not HAS_WIN32:
@@ -2350,6 +2351,54 @@ class App(_TK_BASE):
         except tk.TclError:
             pass
 
+    def _apply_class_bg_brush(self):
+        """把 Tk 窗口类的背景刷设为主题底色（best-effort）。
+
+        Tk 在 Windows 上注册的窗口类 hbrBackground 为 NULL：收到
+        WM_ERASEBKGND 时 DefWindowProc 不做任何填充，真正的内容绘制
+        推迟到 Tk 的 idle 回调。Win11 会在窗口最小化时丢弃 DWM 合成
+        表面，恢复时表面为全黑，在几百个控件的 idle 重绘逐个完成前
+        直接露出黑色（"恢复最小化时黑边一闪"的根因）。
+
+        给窗口类挂上主题色实心刷后，系统级曝光（恢复、遮挡后露出）
+        的擦除阶段会先填主题色，黑闪变为同色填充=不可见；Tk 内部
+        重绘用 InvalidateRect(..., FALSE) 不触发擦除，平时行为不变。
+
+        SetClassLongPtr 按"窗口类"生效：Tk 所有子控件共用 TkChild
+        类、顶层 wrapper 用独立类，各设一次即覆盖全部窗口。
+        """
+        try:
+            th = self.theme["app_bg"]  # "#RRGGBB"
+            colorref = (int(th[1:3], 16)
+                        | int(th[3:5], 16) << 8
+                        | int(th[5:7], 16) << 16)  # COLORREF = 0x00BBGGRR
+            gdi32 = ctypes.windll.gdi32
+            user32 = ctypes.windll.user32
+            new_brush = gdi32.CreateSolidBrush(colorref)
+            if not new_brush:
+                return
+            # 64 位下必须用 SetClassLongPtrW 并声明指针宽度的签名，
+            # 否则句柄被截断；32 位 Python 无此符号，回退 SetClassLongW
+            set_cls = getattr(user32, "SetClassLongPtrW", None) \
+                or user32.SetClassLongW
+            set_cls.restype = ctypes.c_ssize_t
+            set_cls.argtypes = [ctypes.c_ssize_t, ctypes.c_int,
+                                ctypes.c_ssize_t]
+            GCLP_HBRBACKGROUND = -10
+            self.update_idletasks()
+            child = self.winfo_id()                 # TkChild 类
+            top = user32.GetParent(child)           # 顶层 wrapper 类
+            for hwnd in {child, top}:
+                if hwnd:
+                    set_cls(hwnd, GCLP_HBRBACKGROUND, new_brush)
+            # 释放上一次主题切换时创建的旧刷子（类已不再引用它）
+            old = getattr(self, "_bg_brush", None)
+            if old:
+                gdi32.DeleteObject(old)
+            self._bg_brush = new_brush
+        except Exception:
+            pass
+
     def _apply_titlebar_dark(self):
         """Windows 10 1809+ / 11：让标题栏跟随深色主题（best-effort）。
 
@@ -2404,6 +2453,7 @@ class App(_TK_BASE):
             pass
         self._apply_style_theme()
         self._apply_titlebar_dark()
+        self._apply_class_bg_brush()
         for f in self.folders:
             try:
                 f.apply_theme()
