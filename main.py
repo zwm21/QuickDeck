@@ -1951,6 +1951,15 @@ class FolderFrame(tk.Frame):
                 self._reflow()
             except Exception:
                 pass
+        # 折叠/展开改变内容高度，但 inner_frame 是 canvas window item、
+        # 高度未绑定内容，reqheight 变化不必然触发它的 <Configure>，
+        # 滚动区可能停留在旧值。先结清挂起的几何计算（after_idle 时序
+        # 不可靠——回调可能排在 packer 的几何重算之前跑），再主动重算
+        try:
+            self.app.update_idletasks()
+            self.app._update_scrollregion()
+        except Exception:
+            pass
 
     def _on_folder_drag_start(self, e):
         # 文件夹之间仍可拖动（不受 lock 影响）
@@ -2058,6 +2067,13 @@ class FolderFrame(tk.Frame):
         # 强制立即完成布局
         try:
             self.update_idletasks()
+        except Exception:
+            pass
+        # inner_frame 作为 canvas window item 的高度由 App 显式管理
+        # （见 _update_scrollregion），内容高度变化不会自发触发它的
+        # <Configure>——凡经过 _reflow 的增删/重排都在这里主动同步
+        try:
+            self.app._update_scrollregion()
         except Exception:
             pass
 
@@ -2751,6 +2767,13 @@ class App(_TK_BASE):
             self.update_idletasks()
         except Exception:
             pass
+        # 视图切换大幅改变内容高度；window item 高度被 _update_scrollregion
+        # 钉在旧视图的值时 inner_frame 的 <Configure> 不会触发（高度恒定），
+        # 必须显式重新同步，否则切回内容更高的视图时下方卡片被钳制 unmap
+        try:
+            self._update_scrollregion()
+        except Exception:
+            pass
 
     def _reflow_flat(self, cards):
         """把 cards 按 App.card_width 平铺 grid 进 flat_view。
@@ -2820,11 +2843,47 @@ class App(_TK_BASE):
     # ============================================================
     # Canvas / 滚动
     # ============================================================
+    def _update_scrollregion(self):
+        """scrollregion 高度不小于画布可视高度。
+
+        Tk Canvas 的滚动钳制在 scrollregion 比可视区还小时不完全生效：
+        yview_scroll 仍能把内容整体推出可视区顶部并停住（内容不满一屏
+        时向下滚出现顶部留白的根因）。把 region 高度兜底到画布高度后，
+        内容不满一屏时 yview 恒为 (0,1)，滚动自然无从发生。"""
+        # canvas 对 window item 的自动高度跟踪在"已滚动 + 内容收缩"
+        # 场景下不可靠（实测 reqheight 已变、item 高度不收缩），
+        # 显式把 item 高度同步为 inner_frame 的请求高度
+        try:
+            req_h = self.inner_frame.winfo_reqheight()
+            self.canvas.itemconfigure(self.inner_window, height=req_h)
+        except tk.TclError:
+            return
+        bbox = self.canvas.bbox("all")
+        if bbox is None:
+            bbox = (0, 0, 0, 0)
+        x1, y1, x2, y2 = bbox
+        ch = self.canvas.winfo_height()
+        self.canvas.configure(
+            scrollregion=(x1, min(0, y1), x2, max(y2, min(0, y1) + ch)))
+        # 内容缩短（折叠文件夹/删卡片/切视图）后 Tk 不会主动把已有
+        # 滚动偏移拉回新 region 的合法范围。把当前 lo 原样重设一遍：
+        # yview_moveto 内部自带按新 region 的钳制，越界即回拉，
+        # 避免残留"顶部露白"的越界状态
+        try:
+            lo = self.canvas.yview()[0]
+            if lo > 0.0:
+                self.canvas.yview_moveto(lo)
+        except tk.TclError:
+            pass
+
     def _on_inner_configure(self, event):
-        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        self._update_scrollregion()
 
     def _on_canvas_configure(self, event):
         self.canvas.itemconfigure(self.inner_window, width=event.width)
+        # 画布高度变化（拉大窗口）后 region 兜底值要跟着变，
+        # 顺带把可能已产生的越界偏移拉回顶部
+        self._update_scrollregion()
 
     def _on_mousewheel(self, event):
         if not self.folders:
@@ -2836,6 +2895,13 @@ class App(_TK_BASE):
         cy2 = cy1 + self.canvas.winfo_height()
         if not (cx1 <= rx <= cx2 and cy1 <= ry <= cy2):
             return
+        # 内容整屏可见时不滚（双保险；主修复在 _update_scrollregion）
+        try:
+            lo, hi = self.canvas.yview()
+            if lo <= 0.0 and hi >= 1.0:
+                return
+        except tk.TclError:
+            pass
         self.canvas.yview_scroll(int(-event.delta / 120), "units")
 
     # ============================================================
