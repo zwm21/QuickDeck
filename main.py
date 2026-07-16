@@ -11,6 +11,7 @@ import os
 import sys
 import json
 import copy
+import time
 import uuid
 import queue
 import ctypes
@@ -337,10 +338,18 @@ def _sanitize_config(cfg):
             icon = it.get("icon", "")
             if not isinstance(icon, str):
                 icon = ""
+            lc = _int_or(0, it.get("launch_count"), lo=0, hi=10**9)
+            try:
+                ts = float(it.get("last_launch_ts", 0.0))
+            except (TypeError, ValueError):
+                ts = 0.0
+            if ts < 0:
+                ts = 0.0
             clean_items.append({
                 "path": p, "description": desc,
                 "folder": fid, "order": order,
                 "title": title, "icon": icon,
+                "launch_count": lc, "last_launch_ts": ts,
             })
     cfg["shortcuts"] = clean_items
 
@@ -1117,6 +1126,46 @@ def imagefactory_icon(path, size=ICON_SIZE):
 
 
 # ---- 对外统一入口 -----------------------------------------------
+def _parse_url_icon(path):
+    """从 .url（INI 格式）解析 IconFile= / IconIndex= 字段。
+
+    .url 由浏览器/系统生成，编码不统一：常见 ANSI（含本地化路径）、
+    UTF-8（可能带 BOM）、少数 UTF-16。按 BOM → utf-8 → 本机 ANSI
+    顺序尝试解码。解析失败返回 ("", 0)。"""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read(64 * 1024)  # .url 都是小文件，防御性截断
+    except OSError:
+        return "", 0
+    text = None
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        try:
+            text = raw.decode("utf-16")
+        except UnicodeDecodeError:
+            pass
+    if text is None:
+        for enc in ("utf-8-sig", "mbcs"):
+            try:
+                text = raw.decode(enc)
+                break
+            except (UnicodeDecodeError, LookupError):
+                continue
+    if text is None:
+        return "", 0
+    icon_file, icon_index = "", 0
+    for line in text.splitlines():
+        line = line.strip()
+        low = line.lower()
+        if low.startswith("iconfile="):
+            icon_file = os.path.expandvars(line.split("=", 1)[1].strip())
+        elif low.startswith("iconindex="):
+            try:
+                icon_index = int(line.split("=", 1)[1].strip())
+            except ValueError:
+                pass
+    return icon_file, icon_index
+
+
 def get_icon_for_file(path, size=ICON_SIZE):
     """
     多层兜底图标提取：
@@ -1127,6 +1176,10 @@ def get_icon_for_file(path, size=ICON_SIZE):
         4) IShellItemImageFactory 对 TargetPath
         5) SHGetFileInfoW 对 lnk 本身
         6) SHGetFileInfoW 对 TargetPath
+      .url:
+        1) INI 的 IconFile=（图像文件走 PIL；exe/dll 走 ExtractIconEx）
+        2) IShellItemImageFactory / SHGetFileInfoW 对 .url 本身
+           （系统通常给默认浏览器图标）
       其他:
         1) ExtractIconEx
         2) IShellItemImageFactory
@@ -1180,6 +1233,31 @@ def get_icon_for_file(path, size=ICON_SIZE):
             img = shget_icon_image(target, size)
             if img is not None:
                 return img
+    elif ext == ".url":
+        icon_file, icon_index = _parse_url_icon(path)
+        if icon_file and os.path.exists(icon_file):
+            # favicon 缓存常见为 .ico/.png 图像文件，直接 PIL 加载
+            if icon_file.lower().endswith(
+                    (".ico", ".png", ".jpg", ".jpeg", ".bmp", ".gif")):
+                try:
+                    img = Image.open(icon_file)
+                    img.load()
+                    if img.mode != "RGBA":
+                        img = img.convert("RGBA")
+                    return img.resize((size, size), Image.LANCZOS)
+                except Exception:
+                    pass
+            # IconFile 指向 exe/dll 等含图标资源的 PE 文件
+            img = extract_icon_image(icon_file, icon_index, size)
+            if img is not None:
+                return img
+        # 兜底：对 .url 本身走 shell 提取（通常得到默认浏览器图标）
+        img = imagefactory_icon(path, size)
+        if img is not None:
+            return img
+        img = shget_icon_image(path, size)
+        if img is not None:
+            return img
     else:
         img = extract_icon_image(path, 0, size)
         if img is not None:
@@ -1275,6 +1353,23 @@ def icon_cache_put(path, pil):
         print(f"[QuickDeck] icon cache write failed: {e}", file=sys.stderr)
 
 
+def icon_cache_remove(path):
+    """删除该路径当前 key 的内存 + 磁盘缓存条目（右键"刷新图标"用）。
+
+    覆盖缓存盲区：key 含 mtime，但 .lnk 指向的目标 exe 升级换图标时
+    .lnk 本身的 mtime 不变，缓存 key 相同导致永远命中陈旧图标——
+    删掉条目后重新提取即可拿到新图标。"""
+    key = _icon_cache_key(path)
+    with _icon_cache_lock:
+        _icon_mem_cache.pop(key, None)
+    fp = _icon_cache_file(key)
+    try:
+        if os.path.exists(fp):
+            os.remove(fp)
+    except OSError as e:
+        print(f"[QuickDeck] icon cache remove failed: {e}", file=sys.stderr)
+
+
 # ================================================================
 # 快捷方式卡片
 # ================================================================
@@ -1287,7 +1382,8 @@ class ShortcutCard(tk.Frame):
     CARD_WIDTH = 500
 
     def __init__(self, master, app, path, description="",
-                 custom_title="", custom_icon=""):
+                 custom_title="", custom_icon="",
+                 launch_count=0, last_launch_ts=0.0):
         th = app.theme
         super().__init__(master, bd=1, relief="solid",
                          padx=8, pady=6, bg=th["card_bg"])
@@ -1296,6 +1392,9 @@ class ShortcutCard(tk.Frame):
         self.folder = None  # 由 FolderFrame.add_card / insert_card 设置
         self.custom_title = custom_title or ""
         self.custom_icon = custom_icon or ""
+        # 使用统计（"按使用排序"视图的排序依据；随 config 持久化）
+        self.launch_count = max(0, int(launch_count or 0))
+        self.last_launch_ts = max(0.0, float(last_launch_ts or 0.0))
 
         # 图标：
         #   1) 自定义图标文件 → 同步加载（本地图像，开销小）
@@ -1427,6 +1526,12 @@ class ShortcutCard(tk.Frame):
                          command=self._menu_rename, state=state)
         menu.add_command(label="替换图标",
                          command=self._menu_change_icon, state=state)
+        # 刷新图标：删缓存重提取。不改任何用户数据，锁定时也允许；
+        # 已设自定义图标时无意义（显示的不是自动提取结果），禁用
+        menu.add_command(
+            label="刷新图标", command=self._menu_refresh_icon,
+            state="disabled" if (self.custom_icon or not HAS_WIN32)
+            else "normal")
         menu.add_command(label="编辑描述",
                          command=self._menu_edit_desc, state=state)
         menu.add_separator()
@@ -1478,6 +1583,17 @@ class ShortcutCard(tk.Frame):
             return
         if self.set_custom_icon(p):
             self.app.save_state()
+
+    def _menu_refresh_icon(self):
+        """删除该卡片的图标缓存条目并重新入队异步提取。
+        解决"目标应用升级后卡片仍显示旧图标"（缓存 key 的 mtime 盲区）。"""
+        if self.custom_icon or not HAS_WIN32:
+            return
+        icon_cache_remove(self.path)
+        # 先回落占位图标，提取完成后由主线程轮询回填
+        if self.app.default_icon_img is not None:
+            self.set_extracted_icon(self.app.default_icon_img)
+        self.app.request_icon(self)
 
     def _menu_edit_desc(self):
         new = simpledialog.askstring(
@@ -1989,6 +2105,13 @@ class App(_TK_BASE):
         self.dragging_folder = None
         self._save_timer = None
         self._font_apply_timer = None
+        # 视图模式："cards"（文件夹卡片视图，唯一可编辑/拖拽的视图）
+        # / "usage"（按使用频率+最近启动的临时平铺视图）
+        # / "web"（只显示 .url 网页快捷方式的临时平铺视图）。
+        # 临时视图只改显示、不动存储顺序，故不持久化，启动恒为 cards
+        self.view_mode = "cards"
+        self._flat_cards = []
+        self._flat_ncols = 1
 
         # 图标异步提取：worker 线程从 _icon_queue 取任务，
         # 提取结果放 _icon_results，由主线程定时轮询回填
@@ -2245,6 +2368,27 @@ class App(_TK_BASE):
         self.theme_mode_cb.bind("<<ComboboxSelected>>",
                                 self._on_theme_mode_change)
 
+        # 视图切换（卡片视图 / 按使用排序 / 网页快捷方式）
+        lbl = tk.Label(font_card, text="视图：",
+                       font=self.app_font, bg=th["panel_bg"], fg=th["fg"])
+        lbl.pack(side="left", padx=(12, 0))
+        self._panel_labels.append(lbl)
+        self._VIEW_MODE_LABELS = {
+            "cards": "卡片视图", "usage": "按使用排序",
+            "web": "网页快捷方式"}
+        self._VIEW_MODE_BY_LABEL = {
+            v: k for k, v in self._VIEW_MODE_LABELS.items()}
+        self.view_mode_var = tk.StringVar(
+            value=self._VIEW_MODE_LABELS["cards"])
+        self.view_mode_cb = ttk.Combobox(
+            font_card, textvariable=self.view_mode_var,
+            values=["卡片视图", "按使用排序", "网页快捷方式"],
+            state="readonly", width=12
+        )
+        self.view_mode_cb.pack(side="left", padx=(4, 0))
+        self.view_mode_cb.bind("<<ComboboxSelected>>",
+                               self._on_view_mode_change)
+
         # 工具栏
         toolbar = tk.Frame(bottom, bg=th["app_bg"])
         toolbar.pack(side="bottom", fill="x", padx=8, pady=(6, 0))
@@ -2308,6 +2452,16 @@ class App(_TK_BASE):
         self.inner_frame.bind("<Configure>", self._on_inner_configure)
         self.canvas.bind("<Configure>", self._on_canvas_configure)
         self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+
+        # 临时平铺视图容器（按使用排序 / 网页快捷方式共用）。
+        # 与 folder 同为 inner_frame 的直接子级，卡片 grid(in_=) 进来即可，
+        # 切回卡片视图时 pack_forget 隐藏。空标签用于 web 视图无卡片时提示
+        self.flat_view = tk.Frame(self.inner_frame, bg=th["folder_bg"],
+                                  padx=4, pady=3)
+        self.flat_view.bind("<Configure>", self._on_flat_configure)
+        self._flat_empty_label = tk.Label(
+            self.flat_view, text="（没有 .url 网页快捷方式）",
+            font=self.app_font, bg=th["folder_bg"], fg=th["fg"])
 
     def _apply_style_font(self):
         fam = self.app_font.cget("family")
@@ -2436,6 +2590,9 @@ class App(_TK_BASE):
             self.list_wrap.configure(bg=th["app_bg"])
             self.canvas.configure(bg=th["app_bg"])
             self.inner_frame.configure(bg=th["app_bg"])
+            self.flat_view.configure(bg=th["folder_bg"])
+            self._flat_empty_label.configure(bg=th["folder_bg"],
+                                             fg=th["fg"])
             self.font_card.configure(bg=th["panel_bg"])
             for lbl in self._panel_labels:
                 lbl.configure(bg=th["panel_bg"], fg=th["fg"])
@@ -2493,6 +2650,127 @@ class App(_TK_BASE):
         self.after(5000, self._poll_theme_change)
 
     # ============================================================
+    # 视图切换（卡片视图 / 按使用排序 / 网页快捷方式）
+    # ============================================================
+    def _on_view_mode_change(self, event=None):
+        mode = self._VIEW_MODE_BY_LABEL.get(
+            self.view_mode_var.get(), "cards")
+        if mode == self.view_mode:
+            return
+        self.view_mode = mode
+        self._refresh_view()
+
+    def _flat_card_list(self):
+        """当前临时视图应显示的卡片列表（只决定显示，不动存储顺序）。"""
+        if self.view_mode == "usage":
+            # 使用频率优先，同频次按最近启动；从未启动过的排最后
+            return sorted(
+                self.all_cards,
+                key=lambda c: (-c.launch_count, -c.last_launch_ts))
+        if self.view_mode == "web":
+            # 保持文件夹内手动顺序
+            return [c for c in self.all_cards
+                    if c.path.lower().endswith(".url")]
+        return []
+
+    def _refresh_view(self):
+        """按 self.view_mode 重建列表区显示。"""
+        if self.view_mode == "cards":
+            try:
+                self.flat_view.pack_forget()
+            except Exception:
+                pass
+            # 卡片先从平铺容器解绑，再由各 folder 的 _reflow 回收
+            for c in self.all_cards:
+                try:
+                    c.grid_forget()
+                except Exception:
+                    pass
+            for f in self.folders:
+                f.pack(fill="x", padx=6, pady=(6, 0))
+                try:
+                    f._reflow()
+                except Exception:
+                    pass
+        else:
+            for f in self.folders:
+                try:
+                    f.pack_forget()
+                except Exception:
+                    pass
+            self.flat_view.pack(fill="x", padx=6, pady=(6, 0))
+            self._reflow_flat(self._flat_card_list())
+        try:
+            self.update_idletasks()
+        except Exception:
+            pass
+
+    def _reflow_flat(self, cards):
+        """把 cards 按 App.card_width 平铺 grid 进 flat_view。
+        列数计算与 FolderFrame._reflow 同一套逻辑。"""
+        self._flat_cards = list(cards)
+        # 所有卡片先解绑（含不在本视图过滤结果里的，例如 web 视图下
+        # 的 .lnk 卡片必须隐藏）
+        for c in self.all_cards:
+            try:
+                c.grid_forget()
+            except Exception:
+                pass
+        try:
+            self._flat_empty_label.grid_forget()
+        except Exception:
+            pass
+        try:
+            self.flat_view.update_idletasks()
+        except Exception:
+            pass
+        w = self.flat_view.winfo_width()
+        if w <= 1:
+            try:
+                iw = self.inner_frame.winfo_width()
+                if iw > 24:
+                    w = iw - 12
+            except Exception:
+                pass
+        if w <= 1:
+            w = max(1, self.winfo_width() - 40)
+        cw = int(self.card_width)
+        ncols = max(1, int(w) // (cw + 10))
+        self._flat_ncols = ncols
+        for col in range(ncols):
+            self.flat_view.grid_columnconfigure(col, minsize=cw, weight=0)
+        for col in range(ncols, ncols + 8):
+            self.flat_view.grid_columnconfigure(col, minsize=0, weight=0)
+        if not self._flat_cards:
+            self._flat_empty_label.grid(row=0, column=0,
+                                        padx=4, pady=4, sticky="w")
+        for i, c in enumerate(self._flat_cards):
+            c.grid(row=i // ncols, column=i % ncols, in_=self.flat_view,
+                   padx=4, pady=4, sticky="ew")
+            # 同 FolderFrame._reflow：防 stacking 覆盖
+            try:
+                c.tkraise()
+            except Exception:
+                pass
+        try:
+            self.update_idletasks()
+        except Exception:
+            pass
+
+    def _on_flat_configure(self, event):
+        """窗口宽度变化时按新宽度重算平铺列数。"""
+        if self.view_mode == "cards":
+            return
+        ncols = max(1, event.width // (int(self.card_width) + 10))
+        if ncols != self._flat_ncols:
+            self._reflow_flat(self._flat_cards)
+
+    def _refresh_view_if_flat(self):
+        """卡片集合变化（添加/删除/移动）后同步临时视图显示。"""
+        if self.view_mode != "cards":
+            self._refresh_view()
+
+    # ============================================================
     # Canvas / 滚动
     # ============================================================
     def _on_inner_configure(self, event):
@@ -2518,7 +2796,9 @@ class App(_TK_BASE):
     # ============================================================
     def _create_folder(self, folder_id, name):
         f = FolderFrame(self.inner_frame, self, folder_id, name)
-        f.pack(fill="x", padx=6, pady=(6, 0))
+        # 临时平铺视图下不显示 folder（切回卡片视图时 _refresh_view 统一 pack）
+        if self.view_mode == "cards":
+            f.pack(fill="x", padx=6, pady=(6, 0))
         self.folders.append(f)
         # 双重防御 stacking 陷阱：新 folder 默认在 inner_frame 里 stacking
         # 最上层，如果之后拖入的 card 是"更早创建"的，card 显示位置在 folder.body
@@ -2595,7 +2875,8 @@ class App(_TK_BASE):
     def _on_add(self):
         path = filedialog.askopenfilename(
             title="选择快捷方式或程序",
-            filetypes=[("快捷方式 / 程序", "*.lnk;*.exe"),
+            filetypes=[("快捷方式 / 程序", "*.lnk;*.exe;*.url"),
+                       ("网页快捷方式", "*.url"),
                        ("所有文件", "*.*")]
         )
         if path:
@@ -2607,7 +2888,8 @@ class App(_TK_BASE):
     def _on_multi_add(self):
         paths = filedialog.askopenfilenames(
             title="选择多个快捷方式或程序",
-            filetypes=[("快捷方式 / 程序", "*.lnk;*.exe"),
+            filetypes=[("快捷方式 / 程序", "*.lnk;*.exe;*.url"),
+                       ("网页快捷方式", "*.url"),
                        ("所有文件", "*.*")]
         )
         target = self.folders[-1] if self.folders else None
@@ -2630,7 +2912,8 @@ class App(_TK_BASE):
         return any(self._normalize_path(c.path) == norm for c in self.all_cards)
 
     def _add_card(self, path, description, folder=None,
-                  custom_title="", custom_icon=""):
+                  custom_title="", custom_icon="",
+                  launch_count=0, last_launch_ts=0.0):
         """添加卡片；重复路径安静跳过。默认加到最后一个文件夹的末尾。"""
         if self._has_card_with_path(path):
             return False
@@ -2641,11 +2924,14 @@ class App(_TK_BASE):
         try:
             card = ShortcutCard(self.inner_frame, self, path, description,
                                 custom_title=custom_title,
-                                custom_icon=custom_icon)
+                                custom_icon=custom_icon,
+                                launch_count=launch_count,
+                                last_launch_ts=last_launch_ts)
         except Exception as e:
             print(f"[QuickDeck] add_card error: {e}", file=sys.stderr)
             return False
         folder.add_card(card)
+        self._refresh_view_if_flat()
         return True
 
     def move_card_to_folder(self, card, target_folder):
@@ -2656,6 +2942,7 @@ class App(_TK_BASE):
                 or getattr(target_folder, "locked", False):
             return
         self._move_card_to(card, target_folder, len(target_folder.cards))
+        self._refresh_view_if_flat()
         self.save_state()
 
     def remove_card(self, card):
@@ -2669,6 +2956,7 @@ class App(_TK_BASE):
             card.destroy()
         except Exception:
             pass
+        self._refresh_view_if_flat()
         self.save_state()
 
     def launch_card(self, card):
@@ -2682,6 +2970,12 @@ class App(_TK_BASE):
             os.startfile(path)
         except Exception as e:
             messagebox.showerror("启动失败", f"{path}\n\n{e}")
+            return
+        # 使用统计：只在成功启动后记账。当前正处于"按使用排序"视图时
+        # 不立即重排——卡片在鼠标下瞬移体验很差，下次进入该视图时生效
+        card.launch_count += 1
+        card.last_launch_ts = time.time()
+        self.save_state()
 
     # ============================================================
     # 加载配置
@@ -2724,7 +3018,9 @@ class App(_TK_BASE):
             target = self.folder_by_id(fid) or self.folders[0]
             self._add_card(p, it.get("description", ""), folder=target,
                            custom_title=it.get("title", ""),
-                           custom_icon=it.get("icon", ""))
+                           custom_icon=it.get("icon", ""),
+                           launch_count=it.get("launch_count", 0),
+                           last_launch_ts=it.get("last_launch_ts", 0.0))
 
     # ============================================================
     # 字体切换
@@ -2792,6 +3088,11 @@ class App(_TK_BASE):
                 folder._reflow()
             except Exception:
                 pass
+        if self.view_mode != "cards":
+            try:
+                self._reflow_flat(self._flat_cards)
+            except Exception:
+                pass
         # 防抖保存
         if self._save_timer is not None:
             try:
@@ -2842,6 +3143,10 @@ class App(_TK_BASE):
     # 卡片拖拽（可跨文件夹）
     # ============================================================
     def card_drag_start(self, card, event):
+        # 临时视图（按使用排序 / 网页快捷方式）只读：拖拽排序只对
+        # 卡片视图有意义，这里直接不进入拖拽状态，motion/end 自然失效
+        if self.view_mode != "cards":
+            return
         self.dragging_card = card
         self.dragging_folder = None
 
@@ -3042,7 +3347,10 @@ class App(_TK_BASE):
                     "folder": f.id,
                     "order": j,
                     "title": getattr(c, "custom_title", "") or "",
-                    "icon": getattr(c, "custom_icon", "") or ""
+                    "icon": getattr(c, "custom_icon", "") or "",
+                    "launch_count": int(getattr(c, "launch_count", 0)),
+                    "last_launch_ts": float(
+                        getattr(c, "last_launch_ts", 0.0)),
                 })
         self.cfg["shortcuts"] = shortcuts
         save_config(self.cfg)
@@ -3057,7 +3365,45 @@ class App(_TK_BASE):
 # ================================================================
 # 程序入口
 # ================================================================
+# 单实例互斥句柄：必须保持进程级引用（进程退出时系统自动释放）。
+# onefile exe 解压启动慢，用户双击两次导致双开很常见，而双开的两个
+# 实例会在退出时互相覆盖 config.json，且用户完全无感知。
+_SINGLE_MUTEX = None
+_MUTEX_NAME = "QuickDeck_SingleInstance_B7A31F2C"
+
+
+def acquire_single_instance():
+    """CreateMutexW 命名互斥。已有实例在运行时激活旧窗口并返回 False；
+    互斥 API 不可用时不阻止启动（宁可双开也不能打不开）。"""
+    global _SINGLE_MUTEX
+    if not sys.platform.startswith("win"):
+        return True
+    try:
+        kernel32 = ctypes.windll.kernel32
+        user32 = ctypes.windll.user32
+        _SINGLE_MUTEX = kernel32.CreateMutexW(None, False, _MUTEX_NAME)
+        ERROR_ALREADY_EXISTS = 183
+        if kernel32.GetLastError() != ERROR_ALREADY_EXISTS:
+            return True
+        # 已有实例：找到旧窗口，还原最小化并前置
+        # Tk 顶层 wrapper 的窗口类名固定为 TkTopLevel；按类名+标题匹配，
+        # 找不到再放宽为仅标题（best-effort，找不到也照样退出，
+        # 不能让第二个实例继续跑）
+        hwnd = user32.FindWindowW("TkTopLevel", "QuickDeck") \
+            or user32.FindWindowW(None, "QuickDeck")
+        if hwnd:
+            SW_RESTORE = 9
+            if user32.IsIconic(hwnd):
+                user32.ShowWindow(hwnd, SW_RESTORE)
+            user32.SetForegroundWindow(hwnd)
+        return False
+    except Exception:
+        return True
+
+
 def main():
+    if not acquire_single_instance():
+        return
     enable_dpi_awareness()
     app = App()
     app.mainloop()
