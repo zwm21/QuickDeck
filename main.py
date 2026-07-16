@@ -123,7 +123,9 @@ DEFAULT_CONFIG = {
     "font": {"family": BUILTIN_FONT_FAMILY, "size": 12},
     "card_width": 500,
     "theme_mode": "system",  # "system" | "light" | "dark"
-    "shortcuts": []
+    "shortcuts": [],
+    # 网页快捷方式独立存储区（.url 不进文件夹，在"网页快捷方式"视图中管理）
+    "web_shortcuts": []
 }
 
 
@@ -352,6 +354,40 @@ def _sanitize_config(cfg):
                 "launch_count": lc, "last_launch_ts": ts,
             })
     cfg["shortcuts"] = clean_items
+
+    # ---- web_shortcuts（独立存储区，与 shortcuts 同构但无 folder） ----
+    raw_web = cfg.get("web_shortcuts")
+    clean_web = []
+    if isinstance(raw_web, list):
+        for i, it in enumerate(raw_web):
+            if not isinstance(it, dict):
+                continue
+            p = it.get("path")
+            if not isinstance(p, str) or not p:
+                continue
+            desc = it.get("description", "")
+            if not isinstance(desc, str):
+                desc = ""
+            order = _int_or(i, it.get("order"), lo=-10**9, hi=10**9)
+            title = it.get("title", "")
+            if not isinstance(title, str):
+                title = ""
+            icon = it.get("icon", "")
+            if not isinstance(icon, str):
+                icon = ""
+            lc = _int_or(0, it.get("launch_count"), lo=0, hi=10**9)
+            try:
+                ts = float(it.get("last_launch_ts", 0.0))
+            except (TypeError, ValueError):
+                ts = 0.0
+            if ts < 0:
+                ts = 0.0
+            clean_web.append({
+                "path": p, "description": desc, "order": order,
+                "title": title, "icon": icon,
+                "launch_count": lc, "last_launch_ts": ts,
+            })
+    cfg["web_shortcuts"] = clean_web
 
     return cfg
 
@@ -1540,6 +1576,7 @@ class ShortcutCard(tk.Frame):
                             bg=th["card_bg"], fg=th["fg"],
                             activebackground=th["header_active_bg"],
                             activeforeground=th["fg"])
+        is_web = self in getattr(self.app, "web_cards", [])
         for f in self.app.folders:
             if f is self.folder:
                 continue
@@ -1548,9 +1585,11 @@ class ShortcutCard(tk.Frame):
             move_menu.add_command(
                 label=f.name, state=item_state,
                 command=lambda tf=f: self.app.move_card_to_folder(self, tf))
+        # 网页区卡片独立于文件夹存放，不提供"移动到文件夹"
         menu.add_cascade(label="移动到文件夹", menu=move_menu,
-                         state=state if len(self.app.folders) > 1
-                         else "disabled")
+                         state="disabled" if is_web
+                         else (state if len(self.app.folders) > 1
+                               else "disabled"))
         menu.add_separator()
         menu.add_command(label="打开文件所在位置",
                          command=self._menu_open_location)
@@ -2105,11 +2144,13 @@ class App(_TK_BASE):
         self.dragging_folder = None
         self._save_timer = None
         self._font_apply_timer = None
-        # 视图模式："cards"（文件夹卡片视图，唯一可编辑/拖拽的视图）
-        # / "usage"（按使用频率+最近启动的临时平铺视图）
-        # / "web"（只显示 .url 网页快捷方式的临时平铺视图）。
-        # 临时视图只改显示、不动存储顺序，故不持久化，启动恒为 cards
+        # 视图模式："cards"（文件夹卡片视图）
+        # / "usage"（按使用频率+最近启动的临时只读平铺视图）
+        # / "web"（网页快捷方式独立存储区：.url 卡片不进文件夹，
+        #   在该视图中单独存放，可拖拽排序/编辑/删除）。
+        # 视图选择不持久化，启动恒为 cards
         self.view_mode = "cards"
+        self.web_cards = []   # 网页区卡片（独立于 folders，顺序即存储顺序）
         self._flat_cards = []
         self._flat_ncols = 1
 
@@ -2235,6 +2276,11 @@ class App(_TK_BASE):
     @property
     def all_cards(self):
         return [c for f in self.folders for c in f.cards]
+
+    @property
+    def every_card(self):
+        """文件夹区 + 网页区全部卡片（去重、主题、usage 排序用）。"""
+        return self.all_cards + self.web_cards
 
     def folder_by_id(self, fid):
         for f in self.folders:
@@ -2616,7 +2662,7 @@ class App(_TK_BASE):
                 f.apply_theme()
             except Exception:
                 pass
-        for c in self.all_cards:
+        for c in self.every_card:
             try:
                 c.apply_theme()
             except Exception:
@@ -2661,16 +2707,16 @@ class App(_TK_BASE):
         self._refresh_view()
 
     def _flat_card_list(self):
-        """当前临时视图应显示的卡片列表（只决定显示，不动存储顺序）。"""
+        """当前平铺视图应显示的卡片列表。
+        usage：文件夹区+网页区全部卡片按使用排序（临时只读视图）；
+        web：网页区存储顺序本身（可拖拽排序的独立存储区）。"""
         if self.view_mode == "usage":
             # 使用频率优先，同频次按最近启动；从未启动过的排最后
             return sorted(
-                self.all_cards,
+                self.every_card,
                 key=lambda c: (-c.launch_count, -c.last_launch_ts))
         if self.view_mode == "web":
-            # 保持文件夹内手动顺序
-            return [c for c in self.all_cards
-                    if c.path.lower().endswith(".url")]
+            return list(self.web_cards)
         return []
 
     def _refresh_view(self):
@@ -2680,8 +2726,9 @@ class App(_TK_BASE):
                 self.flat_view.pack_forget()
             except Exception:
                 pass
-            # 卡片先从平铺容器解绑，再由各 folder 的 _reflow 回收
-            for c in self.all_cards:
+            # 全部卡片先从平铺容器解绑（含网页区卡片——它们不属于
+            # 任何 folder，解绑后即隐藏），文件夹区卡片由 _reflow 回收
+            for c in self.every_card:
                 try:
                     c.grid_forget()
                 except Exception:
@@ -2709,9 +2756,9 @@ class App(_TK_BASE):
         """把 cards 按 App.card_width 平铺 grid 进 flat_view。
         列数计算与 FolderFrame._reflow 同一套逻辑。"""
         self._flat_cards = list(cards)
-        # 所有卡片先解绑（含不在本视图过滤结果里的，例如 web 视图下
-        # 的 .lnk 卡片必须隐藏）
-        for c in self.all_cards:
+        # 所有卡片先解绑（含不在本视图结果里的，例如 web 视图下
+        # 文件夹区的 .lnk 卡片必须隐藏）
+        for c in self.every_card:
             try:
                 c.grid_forget()
             except Exception:
@@ -2909,14 +2956,22 @@ class App(_TK_BASE):
 
     def _has_card_with_path(self, path):
         norm = self._normalize_path(path)
-        return any(self._normalize_path(c.path) == norm for c in self.all_cards)
+        return any(self._normalize_path(c.path) == norm
+                   for c in self.every_card)
 
     def _add_card(self, path, description, folder=None,
                   custom_title="", custom_icon="",
                   launch_count=0, last_launch_ts=0.0):
-        """添加卡片；重复路径安静跳过。默认加到最后一个文件夹的末尾。"""
+        """添加卡片；重复路径安静跳过。
+        .url 自动进网页快捷方式独立存储区（不进文件夹）；
+        其余默认加到最后一个文件夹的末尾。"""
         if self._has_card_with_path(path):
             return False
+        if path.lower().endswith(".url"):
+            return self._add_web_card(
+                path, description, custom_title=custom_title,
+                custom_icon=custom_icon, launch_count=launch_count,
+                last_launch_ts=last_launch_ts)
         if folder is None:
             if not self.folders:
                 self._create_folder(self.DEFAULT_FOLDER_ID, "默认")
@@ -2934,6 +2989,24 @@ class App(_TK_BASE):
         self._refresh_view_if_flat()
         return True
 
+    def _add_web_card(self, path, description="", custom_title="",
+                      custom_icon="", launch_count=0, last_launch_ts=0.0):
+        """把 .url 加入网页快捷方式独立存储区末尾（调用方已做去重）。"""
+        try:
+            card = ShortcutCard(self.inner_frame, self, path, description,
+                                custom_title=custom_title,
+                                custom_icon=custom_icon,
+                                launch_count=launch_count,
+                                last_launch_ts=last_launch_ts)
+        except Exception as e:
+            print(f"[QuickDeck] add_web_card error: {e}", file=sys.stderr)
+            return False
+        # folder 保持 None：网页区卡片不属于任何文件夹，
+        # ShortcutCard 内所有 locked 判断走 getattr 默认 False，天然可编辑
+        self.web_cards.append(card)
+        self._refresh_view_if_flat()
+        return True
+
     def move_card_to_folder(self, card, target_folder):
         """右键菜单"移动到文件夹"：追加到目标 folder 末尾。"""
         if card.folder is target_folder:
@@ -2946,6 +3019,16 @@ class App(_TK_BASE):
         self.save_state()
 
     def remove_card(self, card):
+        # 网页区卡片：从独立列表移除（不涉及 folder / 锁定）
+        if card in self.web_cards:
+            self.web_cards.remove(card)
+            try:
+                card.destroy()
+            except Exception:
+                pass
+            self._refresh_view_if_flat()
+            self.save_state()
+            return
         folder = card.folder
         # folder 上锁时，任何路径的删除都失效（含未来可能的键盘快捷键等）
         if folder is not None and getattr(folder, "locked", False):
@@ -3016,11 +3099,26 @@ class App(_TK_BASE):
                 continue
             fid = it.get("folder") or self.DEFAULT_FOLDER_ID
             target = self.folder_by_id(fid) or self.folders[0]
+            # 旧配置迁移：文件夹里的 .url 会被 _add_card 自动路由到
+            # 网页区（追加到末尾），下次 save_state 起进入 web_shortcuts
             self._add_card(p, it.get("description", ""), folder=target,
                            custom_title=it.get("title", ""),
                            custom_icon=it.get("icon", ""),
                            launch_count=it.get("launch_count", 0),
                            last_launch_ts=it.get("last_launch_ts", 0.0))
+
+        # 网页快捷方式独立存储区
+        web_items = sorted(self.cfg.get("web_shortcuts") or [],
+                           key=lambda x: x.get("order", 0))
+        for it in web_items:
+            p = it.get("path")
+            if not p or self._has_card_with_path(p):
+                continue
+            self._add_web_card(p, it.get("description", ""),
+                               custom_title=it.get("title", ""),
+                               custom_icon=it.get("icon", ""),
+                               launch_count=it.get("launch_count", 0),
+                               last_launch_ts=it.get("last_launch_ts", 0.0))
 
     # ============================================================
     # 字体切换
@@ -3143,15 +3241,23 @@ class App(_TK_BASE):
     # 卡片拖拽（可跨文件夹）
     # ============================================================
     def card_drag_start(self, card, event):
-        # 临时视图（按使用排序 / 网页快捷方式）只读：拖拽排序只对
-        # 卡片视图有意义，这里直接不进入拖拽状态，motion/end 自然失效
-        if self.view_mode != "cards":
+        # usage 视图为临时只读视图，禁止拖拽；
+        # cards 视图允许文件夹区卡片拖拽；web 视图允许网页区卡片排序
+        if self.view_mode == "usage":
+            return
+        if self.view_mode == "web" and card not in self.web_cards:
+            return
+        if self.view_mode == "cards" and card in self.web_cards:
             return
         self.dragging_card = card
         self.dragging_folder = None
 
     def card_drag_motion(self, card, event):
         if self.dragging_card is not card:
+            return
+        # 网页区排序：在 web_cards 列表内移动，不涉及 folder
+        if self.view_mode == "web":
+            self._web_drag_motion(card, event)
             return
         x, y = event.x_root, event.y_root
         target_folder = self._folder_at_y(y)
@@ -3164,9 +3270,44 @@ class App(_TK_BASE):
         target_pos = self._insert_position_in_folder(target_folder, x, y, card)
         self._move_card_to(card, target_folder, target_pos)
 
+    def _web_drag_motion(self, card, event):
+        """网页快捷方式视图内拖拽排序：按鼠标位置找最近卡片决定插入点，
+        与 _insert_position_in_folder 同一套判定逻辑。"""
+        others = [c for c in self.web_cards if c is not card]
+        if not others:
+            return
+        x, y = event.x_root, event.y_root
+        best_i, best_d = 0, float("inf")
+        for i, c in enumerate(others):
+            try:
+                cx = c.winfo_rootx() + c.winfo_width() / 2
+                cy = c.winfo_rooty() + c.winfo_height() / 2
+            except tk.TclError:
+                continue
+            d = (cx - x) ** 2 + (cy - y) ** 2
+            if d < best_d:
+                best_d, best_i = d, i
+        bc = others[best_i]
+        ccx = bc.winfo_rootx() + bc.winfo_width() / 2
+        ccy = bc.winfo_rooty() + bc.winfo_height() / 2
+        if y < ccy - bc.winfo_height() / 3:
+            pos = best_i
+        elif y > ccy + bc.winfo_height() / 3:
+            pos = best_i + 1
+        else:
+            pos = best_i if x < ccx else best_i + 1
+        new_order = others[:pos] + [card] + others[pos:]
+        if new_order == self.web_cards:
+            return
+        self.web_cards = new_order
+        self._reflow_flat(self.web_cards)
+
     def card_drag_end(self, card, event):
         if self.dragging_card is card:
             self.dragging_card = None
+            if self.view_mode == "web":
+                self.save_state()
+                return
             # 拖拽过程中每次 motion 都做过局部 reflow，但如果最后落点是刚
             # 新建的空文件夹，body 尚未完成首次布局，卡片可能显示不出。
             # 收尾时对所有 folder 强制走一次完整 reflow + 顶层 update，
@@ -3353,6 +3494,18 @@ class App(_TK_BASE):
                         getattr(c, "last_launch_ts", 0.0)),
                 })
         self.cfg["shortcuts"] = shortcuts
+        self.cfg["web_shortcuts"] = [
+            {
+                "path": c.path,
+                "description": c.desc_var.get(),
+                "order": j,
+                "title": getattr(c, "custom_title", "") or "",
+                "icon": getattr(c, "custom_icon", "") or "",
+                "launch_count": int(getattr(c, "launch_count", 0)),
+                "last_launch_ts": float(getattr(c, "last_launch_ts", 0.0)),
+            }
+            for j, c in enumerate(self.web_cards)
+        ]
         save_config(self.cfg)
 
     def _on_close(self):
