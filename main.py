@@ -2021,28 +2021,42 @@ class FolderFrame(tk.Frame):
 
     def _reflow(self):
         """按当前 num_cols 把 cards 重排到 body 的 grid。"""
-        # 先让 body 完成挂起的几何计算，读到真实宽度再决定列数；
-        # 否则新建的空文件夹 body.winfo_width() 可能仍是 1，
-        # 导致 _num_cols 停留在初始 1，且列 minsize=500 超出 body 实际宽度。
-        try:
-            self.body.update_idletasks()
-        except Exception:
-            pass
-        actual_w = self.body.winfo_width()
-        # body 刚 pack 完还未完成 fill 扩展时 winfo_width=1，
-        # 逐级向上兜底：folder 自身宽度 → 上层 inner_frame 宽度。
-        # 减去 body 的 padx=6 左右两侧共 12px。
-        if actual_w <= 1:
-            fw = self.winfo_width()
-            if fw > 12:
-                actual_w = fw - 12
-        if actual_w <= 1:
+        # 视图切换批处理中禁止一切 update_idletasks：它是全局刷新，
+        # 会把切换中途的半成品布局刷上屏（卡片新旧坐标混杂 → 肉眼可见
+        # 的重叠残影）。宽度改从 inner_frame 直接读——canvas 通过
+        # itemconfigure 恒同步其宽度，不需要等几何刷新
+        batch = getattr(self.app, "_view_switch_batch", False)
+        actual_w = 0
+        if batch:
             try:
                 mw = self.master.winfo_width()
                 if mw > 24:
                     actual_w = mw - 24
             except Exception:
                 pass
+        if actual_w <= 1:
+            # 先让 body 完成挂起的几何计算，读到真实宽度再决定列数；
+            # 否则新建的空文件夹 body.winfo_width() 可能仍是 1，
+            # 导致 _num_cols 停留在初始 1，且列 minsize=500 超出 body 实际宽度。
+            try:
+                self.body.update_idletasks()
+            except Exception:
+                pass
+            actual_w = self.body.winfo_width()
+            # body 刚 pack 完还未完成 fill 扩展时 winfo_width=1，
+            # 逐级向上兜底：folder 自身宽度 → 上层 inner_frame 宽度。
+            # 减去 body 的 padx=6 左右两侧共 12px。
+            if actual_w <= 1:
+                fw = self.winfo_width()
+                if fw > 12:
+                    actual_w = fw - 12
+            if actual_w <= 1:
+                try:
+                    mw = self.master.winfo_width()
+                    if mw > 24:
+                        actual_w = mw - 24
+                except Exception:
+                    pass
         if actual_w > 1:
             self._num_cols = self._compute_num_cols(actual_w)
 
@@ -2078,18 +2092,19 @@ class FolderFrame(tk.Frame):
                 c.tkraise()
             except Exception:
                 pass
-        # 强制立即完成布局
-        try:
-            self.update_idletasks()
-        except Exception:
-            pass
-        # inner_frame 作为 canvas window item 的高度由 App 显式管理
-        # （见 _update_scrollregion），内容高度变化不会自发触发它的
-        # <Configure>——凡经过 _reflow 的增删/重排都在这里主动同步
-        try:
-            self.app._update_scrollregion()
-        except Exception:
-            pass
+        # 强制立即完成布局（批处理时跳过，统一由 _refresh_view 末尾刷新）
+        if not batch:
+            try:
+                self.update_idletasks()
+            except Exception:
+                pass
+            # inner_frame 作为 canvas window item 的高度由 App 显式管理
+            # （见 _update_scrollregion），内容高度变化不会自发触发它的
+            # <Configure>——凡经过 _reflow 的增删/重排都在这里主动同步
+            try:
+                self.app._update_scrollregion()
+            except Exception:
+                pass
 
 
 # ================================================================
@@ -2186,6 +2201,10 @@ class App(_TK_BASE):
         self.dir_cards = []   # 文件夹区卡片（同上，存目录路径）
         self._flat_cards = []
         self._flat_ncols = 1
+        # 视图切换批处理标志：_refresh_view 全程为 True，抑制
+        # _reflow / _reflow_flat 的中间 update_idletasks（防半成品
+        # 布局上屏造成的卡片重叠残影），末尾统一刷新一次
+        self._view_switch_batch = False
 
         # 图标异步提取：worker 线程从 _icon_queue 取任务，
         # 提取结果放 _icon_results，由主线程定时轮询回填
@@ -2814,33 +2833,43 @@ class App(_TK_BASE):
         return []
 
     def _refresh_view(self):
-        """按 self.view_mode 重建列表区显示。"""
-        if self.view_mode == "cards":
-            try:
-                self.flat_view.pack_forget()
-            except Exception:
-                pass
-            # 全部卡片先从平铺容器解绑（含网页区卡片——它们不属于
-            # 任何 folder，解绑后即隐藏），文件夹区卡片由 _reflow 回收
-            for c in self.every_card:
+        """按 self.view_mode 重建列表区显示。
+
+        全程置 _view_switch_batch，抑制 _reflow / _reflow_flat 内部的
+        update_idletasks——它们是全局刷新，会把切换中途的半成品布局
+        （部分卡片已挪到新坐标、部分还在旧坐标）刷上屏幕，一次切换
+        刷 N 帧，肉眼即"卡片重叠"残影。批处理下整个切换只在末尾
+        刷一次屏，屏幕上只出现最终布局。"""
+        self._view_switch_batch = True
+        try:
+            if self.view_mode == "cards":
                 try:
-                    c.grid_forget()
+                    self.flat_view.pack_forget()
                 except Exception:
                     pass
-            for f in self.folders:
-                f.pack(fill="x", padx=6, pady=(6, 0))
-                try:
-                    f._reflow()
-                except Exception:
-                    pass
-        else:
-            for f in self.folders:
-                try:
-                    f.pack_forget()
-                except Exception:
-                    pass
-            self.flat_view.pack(fill="x", padx=6, pady=(6, 0))
-            self._reflow_flat(self._flat_card_list())
+                # 全部卡片先从平铺容器解绑（含网页区卡片——它们不属于
+                # 任何 folder，解绑后即隐藏），文件夹区卡片由 _reflow 回收
+                for c in self.every_card:
+                    try:
+                        c.grid_forget()
+                    except Exception:
+                        pass
+                for f in self.folders:
+                    f.pack(fill="x", padx=6, pady=(6, 0))
+                    try:
+                        f._reflow()
+                    except Exception:
+                        pass
+            else:
+                for f in self.folders:
+                    try:
+                        f.pack_forget()
+                    except Exception:
+                        pass
+                self.flat_view.pack(fill="x", padx=6, pady=(6, 0))
+                self._reflow_flat(self._flat_card_list())
+        finally:
+            self._view_switch_batch = False
         try:
             self.update_idletasks()
         except Exception:
@@ -2868,11 +2897,16 @@ class App(_TK_BASE):
             self._flat_empty_label.grid_forget()
         except Exception:
             pass
-        try:
-            self.flat_view.update_idletasks()
-        except Exception:
-            pass
-        w = self.flat_view.winfo_width()
+        # 宽度：批处理中禁 update_idletasks（防中间布局上屏，见
+        # _refresh_view），直接读 canvas 恒同步宽度的 inner_frame
+        batch = getattr(self, "_view_switch_batch", False)
+        w = 0
+        if not batch:
+            try:
+                self.flat_view.update_idletasks()
+            except Exception:
+                pass
+            w = self.flat_view.winfo_width()
         if w <= 1:
             try:
                 iw = self.inner_frame.winfo_width()
@@ -2903,10 +2937,11 @@ class App(_TK_BASE):
                 c.tkraise()
             except Exception:
                 pass
-        try:
-            self.update_idletasks()
-        except Exception:
-            pass
+        if not batch:
+            try:
+                self.update_idletasks()
+            except Exception:
+                pass
 
     def _on_flat_configure(self, event):
         """窗口宽度变化时按新宽度重算平铺列数。"""
@@ -3009,6 +3044,14 @@ class App(_TK_BASE):
         # 需要等下次几何刷新才显示。
         try:
             self.update()
+        except Exception:
+            pass
+        # inner_window 高度被 _update_scrollregion 钉死后，inner_frame 的
+        # <Configure> 不会因内容增高自发触发；新 folder pack 进来若不显式
+        # 同步，会落在钉住高度之外被裁剪（不可见），且 scrollregion 仍是
+        # 旧值（yview 恒 (0,1)），滚轮守卫直接放弃滚动——必须主动同步
+        try:
+            self._update_scrollregion()
         except Exception:
             pass
         return f
@@ -3126,6 +3169,13 @@ class App(_TK_BASE):
         try:
             folder.pack_forget()
             folder.destroy()
+        except Exception:
+            pass
+        # 空文件夹删除不经过任何 _reflow，内容变矮后必须显式同步
+        # 钉住的 window item 高度与 scrollregion（同 _create_folder 注释）
+        try:
+            self.update_idletasks()
+            self._update_scrollregion()
         except Exception:
             pass
         self.save_state()
