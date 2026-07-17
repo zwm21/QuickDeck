@@ -125,7 +125,10 @@ DEFAULT_CONFIG = {
     "theme_mode": "system",  # "system" | "light" | "dark"
     "shortcuts": [],
     # 网页快捷方式独立存储区（.url 不进文件夹，在"网页快捷方式"视图中管理）
-    "web_shortcuts": []
+    "web_shortcuts": [],
+    # 文件夹快捷方式独立存储区（目录路径不进文件夹分组，
+    # 在"文件夹快捷方式"视图中管理，双击在资源管理器中打开）
+    "dir_shortcuts": []
 }
 
 
@@ -355,39 +358,41 @@ def _sanitize_config(cfg):
             })
     cfg["shortcuts"] = clean_items
 
-    # ---- web_shortcuts（独立存储区，与 shortcuts 同构但无 folder） ----
-    raw_web = cfg.get("web_shortcuts")
-    clean_web = []
-    if isinstance(raw_web, list):
-        for i, it in enumerate(raw_web):
-            if not isinstance(it, dict):
-                continue
-            p = it.get("path")
-            if not isinstance(p, str) or not p:
-                continue
-            desc = it.get("description", "")
-            if not isinstance(desc, str):
-                desc = ""
-            order = _int_or(i, it.get("order"), lo=-10**9, hi=10**9)
-            title = it.get("title", "")
-            if not isinstance(title, str):
-                title = ""
-            icon = it.get("icon", "")
-            if not isinstance(icon, str):
-                icon = ""
-            lc = _int_or(0, it.get("launch_count"), lo=0, hi=10**9)
-            try:
-                ts = float(it.get("last_launch_ts", 0.0))
-            except (TypeError, ValueError):
-                ts = 0.0
-            if ts < 0:
-                ts = 0.0
-            clean_web.append({
-                "path": p, "description": desc, "order": order,
-                "title": title, "icon": icon,
-                "launch_count": lc, "last_launch_ts": ts,
-            })
-    cfg["web_shortcuts"] = clean_web
+    # ---- 独立存储区（web_shortcuts / dir_shortcuts，
+    #      与 shortcuts 同构但无 folder 字段） ----
+    for area_key in ("web_shortcuts", "dir_shortcuts"):
+        raw_area = cfg.get(area_key)
+        clean_area = []
+        if isinstance(raw_area, list):
+            for i, it in enumerate(raw_area):
+                if not isinstance(it, dict):
+                    continue
+                p = it.get("path")
+                if not isinstance(p, str) or not p:
+                    continue
+                desc = it.get("description", "")
+                if not isinstance(desc, str):
+                    desc = ""
+                order = _int_or(i, it.get("order"), lo=-10**9, hi=10**9)
+                title = it.get("title", "")
+                if not isinstance(title, str):
+                    title = ""
+                icon = it.get("icon", "")
+                if not isinstance(icon, str):
+                    icon = ""
+                lc = _int_or(0, it.get("launch_count"), lo=0, hi=10**9)
+                try:
+                    ts = float(it.get("last_launch_ts", 0.0))
+                except (TypeError, ValueError):
+                    ts = 0.0
+                if ts < 0:
+                    ts = 0.0
+                clean_area.append({
+                    "path": p, "description": desc, "order": order,
+                    "title": title, "icon": icon,
+                    "launch_count": lc, "last_launch_ts": ts,
+                })
+        cfg[area_key] = clean_area
 
     return cfg
 
@@ -1311,8 +1316,15 @@ def get_icon_for_file(path, size=ICON_SIZE):
 
 
 def get_title_for_file(path):
-    """默认标题：文件名（不含扩展名）。"""
-    return os.path.splitext(os.path.basename(path))[0]
+    """默认标题：文件名（不含扩展名）。
+    目录路径取末级目录名（不做去扩展名——目录名里的点是名字的一部分）；
+    盘符根目录（如 C:\\）basename 为空，退回显示完整路径。"""
+    base = os.path.basename(path.rstrip("\\/"))
+    if not base:
+        return path
+    if os.path.isdir(path):
+        return base
+    return os.path.splitext(base)[0]
 
 
 def make_default_icon(size=ICON_SIZE):
@@ -1576,7 +1588,9 @@ class ShortcutCard(tk.Frame):
                             bg=th["card_bg"], fg=th["fg"],
                             activebackground=th["header_active_bg"],
                             activeforeground=th["fg"])
-        is_web = self in getattr(self.app, "web_cards", [])
+        # 独立存储区卡片（网页区 / 文件夹区）不属于任何文件夹分组
+        standalone = (self in getattr(self.app, "web_cards", [])
+                      or self in getattr(self.app, "dir_cards", []))
         for f in self.app.folders:
             if f is self.folder:
                 continue
@@ -1585,9 +1599,9 @@ class ShortcutCard(tk.Frame):
             move_menu.add_command(
                 label=f.name, state=item_state,
                 command=lambda tf=f: self.app.move_card_to_folder(self, tf))
-        # 网页区卡片独立于文件夹存放，不提供"移动到文件夹"
+        # 独立区卡片不进文件夹分组，不提供"移动到文件夹"
         menu.add_cascade(label="移动到文件夹", menu=move_menu,
-                         state="disabled" if is_web
+                         state="disabled" if standalone
                          else (state if len(self.app.folders) > 1
                                else "disabled"))
         menu.add_separator()
@@ -2163,10 +2177,13 @@ class App(_TK_BASE):
         # 视图模式："cards"（文件夹卡片视图）
         # / "usage"（按使用频率+最近启动的临时只读平铺视图）
         # / "web"（网页快捷方式独立存储区：.url 卡片不进文件夹，
-        #   在该视图中单独存放，可拖拽排序/编辑/删除）。
+        #   在该视图中单独存放，可拖拽排序/编辑/删除）
+        # / "dirs"（文件夹快捷方式独立存储区：目录路径卡片，
+        #   双击在资源管理器中打开，与 web 区同构）。
         # 视图选择不持久化，启动恒为 cards
         self.view_mode = "cards"
         self.web_cards = []   # 网页区卡片（独立于 folders，顺序即存储顺序）
+        self.dir_cards = []   # 文件夹区卡片（同上，存目录路径）
         self._flat_cards = []
         self._flat_ncols = 1
 
@@ -2197,6 +2214,7 @@ class App(_TK_BASE):
             )
             self.add_btn.configure(state="disabled")
             self.multi_add_btn.configure(state="disabled")
+            self.add_dir_btn.configure(state="disabled")
             self.new_folder_btn.configure(state="disabled")
         else:
             self._load_from_config()
@@ -2267,7 +2285,8 @@ class App(_TK_BASE):
     # 文件拖放
     # ============================================================
     def _on_file_drop(self, event):
-        """资源管理器拖文件到窗口：逐个添加到最后一个文件夹。"""
+        """资源管理器拖文件到窗口：按类型路由——
+        目录进文件夹快捷方式区，.url 进网页区，其余进最后一个文件夹。"""
         try:
             # event.data 是 Tcl 列表格式，含空格路径会被 {} 包住
             paths = self.tk.splitlist(event.data)
@@ -2278,9 +2297,7 @@ class App(_TK_BASE):
         for p in paths:
             if not p:
                 continue
-            # 目录不收（拖文件夹进来通常是误操作；快捷方式管理器管文件）
-            if os.path.isdir(p):
-                continue
+            # 目录由 _add_card 路由到 dir_cards 独立区
             if self._add_card(p, "", folder=target):
                 added += 1
         if added:
@@ -2295,8 +2312,9 @@ class App(_TK_BASE):
 
     @property
     def every_card(self):
-        """文件夹区 + 网页区全部卡片（去重、主题、usage 排序用）。"""
-        return self.all_cards + self.web_cards
+        """文件夹分组区 + 网页区 + 文件夹快捷方式区全部卡片
+        （去重、主题、usage 排序用）。"""
+        return self.all_cards + self.web_cards + self.dir_cards
 
     def folder_by_id(self, fid):
         for f in self.folders:
@@ -2430,22 +2448,22 @@ class App(_TK_BASE):
         self.theme_mode_cb.bind("<<ComboboxSelected>>",
                                 self._on_theme_mode_change)
 
-        # 视图切换（卡片视图 / 按使用排序 / 网页快捷方式）
+        # 视图切换（卡片视图 / 按使用排序 / 网页快捷方式 / 文件夹快捷方式）
         lbl = tk.Label(font_card, text="视图：",
                        font=self.app_font, bg=th["panel_bg"], fg=th["fg"])
         lbl.pack(side="left", padx=(12, 0))
         self._panel_labels.append(lbl)
         self._VIEW_MODE_LABELS = {
             "cards": "卡片视图", "usage": "按使用排序",
-            "web": "网页快捷方式"}
+            "web": "网页快捷方式", "dirs": "文件夹快捷方式"}
         self._VIEW_MODE_BY_LABEL = {
             v: k for k, v in self._VIEW_MODE_LABELS.items()}
         self.view_mode_var = tk.StringVar(
             value=self._VIEW_MODE_LABELS["cards"])
         self.view_mode_cb = ttk.Combobox(
             font_card, textvariable=self.view_mode_var,
-            values=["卡片视图", "按使用排序", "网页快捷方式"],
-            state="readonly", width=12
+            values=["卡片视图", "按使用排序", "网页快捷方式", "文件夹快捷方式"],
+            state="readonly", width=14
         )
         self.view_mode_cb.pack(side="left", padx=(4, 0))
         self.view_mode_cb.bind("<<ComboboxSelected>>",
@@ -2483,6 +2501,15 @@ class App(_TK_BASE):
         )
         self.new_folder_btn.pack(side="left", padx=(8, 0))
 
+        self.add_dir_btn = tk.Button(
+            toolbar, text="添加文件夹快捷方式",
+            font=self.app_font, command=self._on_add_dir,
+            padx=10, pady=4,
+            bg=th["btn_bg"], fg=th["fg"],
+            activebackground=th["btn_active_bg"], activeforeground=th["fg"]
+        )
+        self.add_dir_btn.pack(side="left", padx=(8, 0))
+
         self.open_dir_btn = tk.Button(
             toolbar, text="打开程序目录",
             font=self.app_font, command=self._on_open_app_dir,
@@ -2515,14 +2542,19 @@ class App(_TK_BASE):
         self.canvas.bind("<Configure>", self._on_canvas_configure)
         self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
 
-        # 临时平铺视图容器（按使用排序 / 网页快捷方式共用）。
+        # 临时平铺视图容器（按使用排序 / 网页快捷方式 / 文件夹快捷方式共用）。
         # 与 folder 同为 inner_frame 的直接子级，卡片 grid(in_=) 进来即可，
-        # 切回卡片视图时 pack_forget 隐藏。空标签用于 web 视图无卡片时提示
+        # 切回卡片视图时 pack_forget 隐藏。空标签在视图无卡片时提示，
+        # 文案随 view_mode 在 _reflow_flat 里切换
         self.flat_view = tk.Frame(self.inner_frame, bg=th["folder_bg"],
                                   padx=4, pady=3)
         self.flat_view.bind("<Configure>", self._on_flat_configure)
+        self._FLAT_EMPTY_TEXT = {
+            "web": "（没有 .url 网页快捷方式）",
+            "dirs": "（没有文件夹快捷方式）",
+            "usage": "（没有任何卡片）"}
         self._flat_empty_label = tk.Label(
-            self.flat_view, text="（没有 .url 网页快捷方式）",
+            self.flat_view, text=self._FLAT_EMPTY_TEXT["web"],
             font=self.app_font, bg=th["folder_bg"], fg=th["fg"])
 
     def _apply_style_font(self):
@@ -2712,7 +2744,7 @@ class App(_TK_BASE):
         self.after(5000, self._poll_theme_change)
 
     # ============================================================
-    # 视图切换（卡片视图 / 按使用排序 / 网页快捷方式）
+    # 视图切换（卡片视图 / 按使用排序 / 网页快捷方式 / 文件夹快捷方式）
     # ============================================================
     def _on_view_mode_change(self, event=None):
         mode = self._VIEW_MODE_BY_LABEL.get(
@@ -2724,8 +2756,8 @@ class App(_TK_BASE):
 
     def _flat_card_list(self):
         """当前平铺视图应显示的卡片列表。
-        usage：文件夹区+网页区全部卡片按使用排序（临时只读视图）；
-        web：网页区存储顺序本身（可拖拽排序的独立存储区）。"""
+        usage：三个存储区全部卡片按使用排序（临时只读视图）；
+        web / dirs：对应独立存储区的存储顺序本身（可拖拽排序）。"""
         if self.view_mode == "usage":
             # 使用频率优先，同频次按最近启动；从未启动过的排最后
             return sorted(
@@ -2733,6 +2765,8 @@ class App(_TK_BASE):
                 key=lambda c: (-c.launch_count, -c.last_launch_ts))
         if self.view_mode == "web":
             return list(self.web_cards)
+        if self.view_mode == "dirs":
+            return list(self.dir_cards)
         return []
 
     def _refresh_view(self):
@@ -2812,6 +2846,9 @@ class App(_TK_BASE):
         for col in range(ncols, ncols + 8):
             self.flat_view.grid_columnconfigure(col, minsize=0, weight=0)
         if not self._flat_cards:
+            self._flat_empty_label.configure(
+                text=self._FLAT_EMPTY_TEXT.get(
+                    self.view_mode, self._FLAT_EMPTY_TEXT["usage"]))
             self._flat_empty_label.grid(row=0, column=0,
                                         padx=4, pady=4, sticky="w")
         for i, c in enumerate(self._flat_cards):
@@ -3011,6 +3048,16 @@ class App(_TK_BASE):
         if paths:
             self.save_state()
 
+    def _on_add_dir(self):
+        """选择一个目录加入文件夹快捷方式独立存储区。"""
+        path = filedialog.askdirectory(title="选择要添加的文件夹")
+        if not path:
+            return
+        # askdirectory 返回正斜杠路径，统一成 Windows 风格
+        path = os.path.normpath(path)
+        if self._add_card(path, ""):
+            self.save_state()
+
     @staticmethod
     def _normalize_path(p):
         if not p:
@@ -3029,15 +3076,21 @@ class App(_TK_BASE):
                   custom_title="", custom_icon="",
                   launch_count=0, last_launch_ts=0.0):
         """添加卡片；重复路径安静跳过。
-        .url 自动进网页快捷方式独立存储区（不进文件夹）；
+        目录自动进文件夹快捷方式独立存储区；
+        .url 自动进网页快捷方式独立存储区（都不进文件夹分组）；
         其余默认加到最后一个文件夹的末尾。"""
         if self._has_card_with_path(path):
             return False
+        if os.path.isdir(path):
+            return self._add_standalone_card(
+                self.dir_cards, path, description,
+                custom_title=custom_title, custom_icon=custom_icon,
+                launch_count=launch_count, last_launch_ts=last_launch_ts)
         if path.lower().endswith(".url"):
-            return self._add_web_card(
-                path, description, custom_title=custom_title,
-                custom_icon=custom_icon, launch_count=launch_count,
-                last_launch_ts=last_launch_ts)
+            return self._add_standalone_card(
+                self.web_cards, path, description,
+                custom_title=custom_title, custom_icon=custom_icon,
+                launch_count=launch_count, last_launch_ts=last_launch_ts)
         if folder is None:
             if not self.folders:
                 self._create_folder(self.DEFAULT_FOLDER_ID, "默认")
@@ -3055,9 +3108,11 @@ class App(_TK_BASE):
         self._refresh_view_if_flat()
         return True
 
-    def _add_web_card(self, path, description="", custom_title="",
-                      custom_icon="", launch_count=0, last_launch_ts=0.0):
-        """把 .url 加入网页快捷方式独立存储区末尾（调用方已做去重）。"""
+    def _add_standalone_card(self, area, path, description="",
+                             custom_title="", custom_icon="",
+                             launch_count=0, last_launch_ts=0.0):
+        """把卡片加入独立存储区（web_cards / dir_cards）末尾
+        （调用方已做去重）。"""
         try:
             card = ShortcutCard(self.inner_frame, self, path, description,
                                 custom_title=custom_title,
@@ -3065,11 +3120,12 @@ class App(_TK_BASE):
                                 launch_count=launch_count,
                                 last_launch_ts=last_launch_ts)
         except Exception as e:
-            print(f"[QuickDeck] add_web_card error: {e}", file=sys.stderr)
+            print(f"[QuickDeck] add_standalone_card error: {e}",
+                  file=sys.stderr)
             return False
-        # folder 保持 None：网页区卡片不属于任何文件夹，
+        # folder 保持 None：独立区卡片不属于任何文件夹，
         # ShortcutCard 内所有 locked 判断走 getattr 默认 False，天然可编辑
-        self.web_cards.append(card)
+        area.append(card)
         self._refresh_view_if_flat()
         return True
 
@@ -3085,16 +3141,18 @@ class App(_TK_BASE):
         self.save_state()
 
     def remove_card(self, card):
-        # 网页区卡片：从独立列表移除（不涉及 folder / 锁定）
-        if card in self.web_cards:
-            self.web_cards.remove(card)
-            try:
-                card.destroy()
-            except Exception:
-                pass
-            self._refresh_view_if_flat()
-            self.save_state()
-            return
+        # 独立存储区卡片（网页区 / 文件夹区）：从对应列表移除
+        # （不涉及 folder / 锁定）
+        for area in (self.web_cards, self.dir_cards):
+            if card in area:
+                area.remove(card)
+                try:
+                    card.destroy()
+                except Exception:
+                    pass
+                self._refresh_view_if_flat()
+                self.save_state()
+                return
         folder = card.folder
         # folder 上锁时，任何路径的删除都失效（含未来可能的键盘快捷键等）
         if folder is not None and getattr(folder, "locked", False):
@@ -3113,7 +3171,7 @@ class App(_TK_BASE):
         try:
             if not os.path.exists(path):
                 messagebox.showwarning(
-                    "启动失败", f"文件不存在:\n{path}"
+                    "启动失败", f"目标不存在:\n{path}"
                 )
                 return
             os.startfile(path)
@@ -3173,18 +3231,21 @@ class App(_TK_BASE):
                            launch_count=it.get("launch_count", 0),
                            last_launch_ts=it.get("last_launch_ts", 0.0))
 
-        # 网页快捷方式独立存储区
-        web_items = sorted(self.cfg.get("web_shortcuts") or [],
+        # 独立存储区：网页快捷方式 + 文件夹快捷方式
+        for cfg_key, area in (("web_shortcuts", self.web_cards),
+                              ("dir_shortcuts", self.dir_cards)):
+            items = sorted(self.cfg.get(cfg_key) or [],
                            key=lambda x: x.get("order", 0))
-        for it in web_items:
-            p = it.get("path")
-            if not p or self._has_card_with_path(p):
-                continue
-            self._add_web_card(p, it.get("description", ""),
-                               custom_title=it.get("title", ""),
-                               custom_icon=it.get("icon", ""),
-                               launch_count=it.get("launch_count", 0),
-                               last_launch_ts=it.get("last_launch_ts", 0.0))
+            for it in items:
+                p = it.get("path")
+                if not p or self._has_card_with_path(p):
+                    continue
+                self._add_standalone_card(
+                    area, p, it.get("description", ""),
+                    custom_title=it.get("title", ""),
+                    custom_icon=it.get("icon", ""),
+                    launch_count=it.get("launch_count", 0),
+                    last_launch_ts=it.get("last_launch_ts", 0.0))
 
     # ============================================================
     # 字体切换
@@ -3308,12 +3369,16 @@ class App(_TK_BASE):
     # ============================================================
     def card_drag_start(self, card, event):
         # usage 视图为临时只读视图，禁止拖拽；
-        # cards 视图允许文件夹区卡片拖拽；web 视图允许网页区卡片排序
+        # cards 视图只允许文件夹分组区卡片拖拽；
+        # web / dirs 视图只允许各自独立区卡片排序
         if self.view_mode == "usage":
             return
         if self.view_mode == "web" and card not in self.web_cards:
             return
-        if self.view_mode == "cards" and card in self.web_cards:
+        if self.view_mode == "dirs" and card not in self.dir_cards:
+            return
+        if self.view_mode == "cards" and (card in self.web_cards
+                                          or card in self.dir_cards):
             return
         self.dragging_card = card
         self.dragging_folder = None
@@ -3321,9 +3386,12 @@ class App(_TK_BASE):
     def card_drag_motion(self, card, event):
         if self.dragging_card is not card:
             return
-        # 网页区排序：在 web_cards 列表内移动，不涉及 folder
+        # 独立区排序：在对应列表内移动，不涉及 folder
         if self.view_mode == "web":
-            self._web_drag_motion(card, event)
+            self._area_drag_motion(card, event, "web_cards")
+            return
+        if self.view_mode == "dirs":
+            self._area_drag_motion(card, event, "dir_cards")
             return
         x, y = event.x_root, event.y_root
         target_folder = self._folder_at_y(y)
@@ -3336,10 +3404,12 @@ class App(_TK_BASE):
         target_pos = self._insert_position_in_folder(target_folder, x, y, card)
         self._move_card_to(card, target_folder, target_pos)
 
-    def _web_drag_motion(self, card, event):
-        """网页快捷方式视图内拖拽排序：按鼠标位置找最近卡片决定插入点，
-        与 _insert_position_in_folder 同一套判定逻辑。"""
-        others = [c for c in self.web_cards if c is not card]
+    def _area_drag_motion(self, card, event, attr):
+        """独立存储区视图（web / dirs）内拖拽排序：按鼠标位置找最近卡片
+        决定插入点，与 _insert_position_in_folder 同一套判定逻辑。
+        attr 为存储列表的属性名（"web_cards" / "dir_cards"）。"""
+        cards = getattr(self, attr)
+        others = [c for c in cards if c is not card]
         if not others:
             return
         x, y = event.x_root, event.y_root
@@ -3363,15 +3433,15 @@ class App(_TK_BASE):
         else:
             pos = best_i if x < ccx else best_i + 1
         new_order = others[:pos] + [card] + others[pos:]
-        if new_order == self.web_cards:
+        if new_order == cards:
             return
-        self.web_cards = new_order
-        self._reflow_flat(self.web_cards)
+        setattr(self, attr, new_order)
+        self._reflow_flat(new_order)
 
     def card_drag_end(self, card, event):
         if self.dragging_card is card:
             self.dragging_card = None
-            if self.view_mode == "web":
+            if self.view_mode in ("web", "dirs"):
                 self.save_state()
                 return
             # 拖拽过程中每次 motion 都做过局部 reflow，但如果最后落点是刚
@@ -3560,18 +3630,21 @@ class App(_TK_BASE):
                         getattr(c, "last_launch_ts", 0.0)),
                 })
         self.cfg["shortcuts"] = shortcuts
-        self.cfg["web_shortcuts"] = [
-            {
-                "path": c.path,
-                "description": c.desc_var.get(),
-                "order": j,
-                "title": getattr(c, "custom_title", "") or "",
-                "icon": getattr(c, "custom_icon", "") or "",
-                "launch_count": int(getattr(c, "launch_count", 0)),
-                "last_launch_ts": float(getattr(c, "last_launch_ts", 0.0)),
-            }
-            for j, c in enumerate(self.web_cards)
-        ]
+        for cfg_key, cards in (("web_shortcuts", self.web_cards),
+                               ("dir_shortcuts", self.dir_cards)):
+            self.cfg[cfg_key] = [
+                {
+                    "path": c.path,
+                    "description": c.desc_var.get(),
+                    "order": j,
+                    "title": getattr(c, "custom_title", "") or "",
+                    "icon": getattr(c, "custom_icon", "") or "",
+                    "launch_count": int(getattr(c, "launch_count", 0)),
+                    "last_launch_ts": float(
+                        getattr(c, "last_launch_ts", 0.0)),
+                }
+                for j, c in enumerate(cards)
+            ]
         save_config(self.cfg)
 
     def _on_close(self):
