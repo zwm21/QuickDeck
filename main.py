@@ -2205,6 +2205,10 @@ class App(_TK_BASE):
         # _reflow / _reflow_flat 的中间 update_idletasks（防半成品
         # 布局上屏造成的卡片重叠残影），末尾统一刷新一次
         self._view_switch_batch = False
+        # WM_SETREDRAW 冻结标志：_freeze_paint 置位，防嵌套冻结
+        # 提前解冻（WM_SETREDRAW 无引用计数，内层 TRUE 会立即解除
+        # 外层的冻结），见 _freeze_paint / _thaw_paint
+        self._paint_frozen = False
 
         # 图标异步提取：worker 线程从 _icon_queue 取任务，
         # 提取结果放 _icon_results，由主线程定时轮询回填
@@ -2784,8 +2788,14 @@ class App(_TK_BASE):
         if mode == self.view_mode:
             return
         self.view_mode = mode
-        self._update_toolbar_buttons()
-        self._refresh_view()
+        # 冻结整个客户区（含工具栏——按钮 repack 同样会留残影），
+        # 待新视图完整就位后一次性重绘，见 _freeze_paint
+        frozen = self._freeze_paint()
+        try:
+            self._update_toolbar_buttons()
+            self._refresh_view()
+        finally:
+            self._thaw_paint(frozen)
 
     def _update_toolbar_buttons(self):
         """工具栏按钮按当前视图显隐：
@@ -2832,55 +2842,106 @@ class App(_TK_BASE):
             return list(self.dir_cards)
         return []
 
+    # WM_SETREDRAW / RedrawWindow 常量
+    _WM_SETREDRAW = 0x000B
+    _RDW_REPAINT = 0x0001 | 0x0004 | 0x0080 | 0x0100  # INVALIDATE|ERASE|ALLCHILDREN|UPDATENOW
+
+    def _freeze_paint(self):
+        """WM_SETREDRAW(FALSE)：冻结客户区 HWND 及其全部子 HWND 的屏幕
+        更新，屏幕定格当前画面。
+
+        视图切换重叠残影的真正根因在 Win32 层：Tk 在 Windows 上每个
+        widget 都是独立 HWND，一次 update_idletasks 内部对每张卡片逐个
+        SetWindowPos，其屏幕效果是立即的——系统把该窗口现有像素 bitblt
+        到新位置，腾出的旧区域只标记 invalidate，擦除要等回到 mainloop
+        处理 WM_PAINT 之后。窗口期内"新位置卡片 + 旧位置陈旧像素"同屏，
+        即同一张卡片出现两次的重叠画面。因此无论把 Tcl 层 flush 压缩到
+        几次都无效（_view_switch_batch 只解决了多帧半成品布局问题）。
+        冻结期间 SetWindowPos 只改几何不上屏，几何计算（winfo_* /
+        update_idletasks）完全不受影响。
+
+        返回冻结的 hwnd（交给 _thaw_paint），已冻结（嵌套调用）或
+        失败时返回 None——WM_SETREDRAW 无引用计数，嵌套必须由外层
+        统一解冻。"""
+        if self._paint_frozen:
+            return None
+        try:
+            hwnd = self.winfo_id()  # 客户区 HWND（wrapper 的子窗口）
+            ctypes.windll.user32.SendMessageW(
+                hwnd, self._WM_SETREDRAW, 0, 0)
+        except Exception:
+            return None
+        self._paint_frozen = True
+        return hwnd
+
+    def _thaw_paint(self, hwnd):
+        """WM_SETREDRAW(TRUE) + RedrawWindow(RDW_ALLCHILDREN)：解冻并
+        令整棵子树一次性重绘——屏幕从完整旧帧直接切到完整新帧。
+        hwnd 为 None（嵌套冻结的内层 / 冻结失败）时不做任何事。"""
+        if not hwnd:
+            return
+        self._paint_frozen = False
+        try:
+            user32 = ctypes.windll.user32
+            user32.SendMessageW(hwnd, self._WM_SETREDRAW, 1, 0)
+            user32.RedrawWindow(hwnd, None, None, self._RDW_REPAINT)
+        except Exception:
+            pass
+
     def _refresh_view(self):
         """按 self.view_mode 重建列表区显示。
 
-        全程置 _view_switch_batch，抑制 _reflow / _reflow_flat 内部的
-        update_idletasks——它们是全局刷新，会把切换中途的半成品布局
-        （部分卡片已挪到新坐标、部分还在旧坐标）刷上屏幕，一次切换
-        刷 N 帧，肉眼即"卡片重叠"残影。批处理下整个切换只在末尾
-        刷一次屏，屏幕上只出现最终布局。"""
-        self._view_switch_batch = True
+        双层防残影：
+        1. _freeze_paint（Win32 层）——冻结屏幕更新，重建期间任何
+           SetWindowPos 都不上屏，解冻时整帧切换。根治重叠残影。
+        2. _view_switch_batch（Tcl 层）——抑制 _reflow / _reflow_flat
+           内部的 update_idletasks，整个切换只在末尾 flush 一次几何。
+           非 Windows / 冻结失败时仍将中间帧数压到最少，作为兜底。"""
+        frozen = self._freeze_paint()
         try:
-            if self.view_mode == "cards":
-                try:
-                    self.flat_view.pack_forget()
-                except Exception:
-                    pass
-                # 全部卡片先从平铺容器解绑（含网页区卡片——它们不属于
-                # 任何 folder，解绑后即隐藏），文件夹区卡片由 _reflow 回收
-                for c in self.every_card:
+            self._view_switch_batch = True
+            try:
+                if self.view_mode == "cards":
                     try:
-                        c.grid_forget()
+                        self.flat_view.pack_forget()
                     except Exception:
                         pass
-                for f in self.folders:
-                    f.pack(fill="x", padx=6, pady=(6, 0))
-                    try:
-                        f._reflow()
-                    except Exception:
-                        pass
-            else:
-                for f in self.folders:
-                    try:
-                        f.pack_forget()
-                    except Exception:
-                        pass
-                self.flat_view.pack(fill="x", padx=6, pady=(6, 0))
-                self._reflow_flat(self._flat_card_list())
+                    # 全部卡片先从平铺容器解绑（含网页区卡片——它们不属于
+                    # 任何 folder，解绑后即隐藏），文件夹区卡片由 _reflow 回收
+                    for c in self.every_card:
+                        try:
+                            c.grid_forget()
+                        except Exception:
+                            pass
+                    for f in self.folders:
+                        f.pack(fill="x", padx=6, pady=(6, 0))
+                        try:
+                            f._reflow()
+                        except Exception:
+                            pass
+                else:
+                    for f in self.folders:
+                        try:
+                            f.pack_forget()
+                        except Exception:
+                            pass
+                    self.flat_view.pack(fill="x", padx=6, pady=(6, 0))
+                    self._reflow_flat(self._flat_card_list())
+            finally:
+                self._view_switch_batch = False
+            try:
+                self.update_idletasks()
+            except Exception:
+                pass
+            # 视图切换大幅改变内容高度；window item 高度被 _update_scrollregion
+            # 钉在旧视图的值时 inner_frame 的 <Configure> 不会触发（高度恒定），
+            # 必须显式重新同步，否则切回内容更高的视图时下方卡片被钳制 unmap
+            try:
+                self._update_scrollregion()
+            except Exception:
+                pass
         finally:
-            self._view_switch_batch = False
-        try:
-            self.update_idletasks()
-        except Exception:
-            pass
-        # 视图切换大幅改变内容高度；window item 高度被 _update_scrollregion
-        # 钉在旧视图的值时 inner_frame 的 <Configure> 不会触发（高度恒定），
-        # 必须显式重新同步，否则切回内容更高的视图时下方卡片被钳制 unmap
-        try:
-            self._update_scrollregion()
-        except Exception:
-            pass
+            self._thaw_paint(frozen)
 
     def _reflow_flat(self, cards):
         """把 cards 按 App.card_width 平铺 grid 进 flat_view。
