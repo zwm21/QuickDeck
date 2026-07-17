@@ -2753,7 +2753,27 @@ class App(_TK_BASE):
             pass
 
     def apply_theme(self, theme):
-        """运行时切换整套主题：App 级控件 + 所有 folder + 所有 card。"""
+        """运行时切换整套主题：App 级控件 + 所有 folder + 所有 card。
+
+        幕布防黑边：主题切换与视图切换是同一类绘制时序问题——几十个
+        控件逐个 reconfigure 的重绘是渐进的，中途 _apply_titlebar_dark
+        切换 DWMWA_USE_IMMERSIVE_DARK_MODE 还会触发 DWM 合成路径重建，
+        把尚未完成重绘的客户区区域合成为黑色（切换瞬间的黑边）。复用
+        _show_paint_curtain 盖住全程，重绘与 DWM 重建都在幕布下完成，
+        撤幕即完整新主题帧。"""
+        curtain = self._show_paint_curtain()
+        try:
+            self._apply_theme_body(theme)
+            if curtain:
+                # 幕布之下把全部控件的重绘做完再撤幕
+                try:
+                    self.update()
+                except Exception:
+                    pass
+        finally:
+            self._hide_paint_curtain(curtain)
+
+    def _apply_theme_body(self, theme):
         self.theme = theme
         th = theme
         try:
