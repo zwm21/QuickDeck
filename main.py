@@ -752,6 +752,47 @@ def _init_win_apis():
         ]
         user32.PrivateExtractIconsW.restype = ctypes.c_uint
 
+        # 幕布截屏窗口（视图切换防残影第三层，见 App._show_paint_curtain）
+        gdi32.CreateCompatibleBitmap.argtypes = [
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+        gdi32.CreateCompatibleBitmap.restype = ctypes.c_void_p
+
+        gdi32.BitBlt.argtypes = [
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int,
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_uint
+        ]
+        gdi32.BitBlt.restype = ctypes.c_int
+
+        user32.CreateWindowExW.argtypes = [
+            ctypes.c_uint, ctypes.c_wchar_p, ctypes.c_wchar_p,
+            ctypes.c_uint,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p
+        ]
+        user32.CreateWindowExW.restype = ctypes.c_void_p
+
+        user32.DestroyWindow.argtypes = [ctypes.c_void_p]
+        user32.DestroyWindow.restype = ctypes.c_int
+
+        user32.UpdateWindow.argtypes = [ctypes.c_void_p]
+        user32.UpdateWindow.restype = ctypes.c_int
+
+        # wParam/lParam 都是指针宽度：STM_SETIMAGE 的 lParam 传 HBITMAP，
+        # c_void_p restype 返回的句柄在 32 位值高位为 1 时是符号扩展的
+        # 64 位无符号大整数，默认 c_int 转换会溢出（是否触发取决于系统
+        # 分配的句柄值，表现为时好时坏）
+        user32.SendMessageW.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p, ctypes.c_void_p]
+        user32.SendMessageW.restype = ctypes.c_void_p
+
+        # HMODULE 是模块基址，64 位高熵 ASLR 下可能超出 32 位，
+        # 必须显式 c_void_p（默认 c_int 会截断）
+        kernel32 = ctypes.windll.kernel32
+        kernel32.GetModuleHandleW.argtypes = [ctypes.c_wchar_p]
+        kernel32.GetModuleHandleW.restype = ctypes.c_void_p
+
         _APIS_INITED = True
     except Exception as e:
         print(f"[QuickDeck] _init_win_apis error: {e}", file=sys.stderr)
@@ -2209,6 +2250,9 @@ class App(_TK_BASE):
         # 提前解冻（WM_SETREDRAW 无引用计数，内层 TRUE 会立即解除
         # 外层的冻结），见 _freeze_paint / _thaw_paint
         self._paint_frozen = False
+        # 幕布标志：_show_paint_curtain 置位，防嵌套挂两层幕布
+        # （_on_view_mode_change 与其内部的 _refresh_view 各有入口）
+        self._curtain_active = False
 
         # 图标异步提取：worker 线程从 _icon_queue 取任务，
         # 提取结果放 _icon_results，由主线程定时轮询回填
@@ -2788,14 +2832,26 @@ class App(_TK_BASE):
         if mode == self.view_mode:
             return
         self.view_mode = mode
-        # 冻结整个客户区（含工具栏——按钮 repack 同样会留残影），
-        # 待新视图完整就位后一次性重绘，见 _freeze_paint
-        frozen = self._freeze_paint()
+        # 三层防残影（见 _show_paint_curtain / _freeze_paint）：
+        # 幕布原位盖住旧帧 → 冻结中完成几何重建（含工具栏 repack）→
+        # 幕布之下把切换排队的事件与逐 widget 重绘全部做完 → 撤幕
+        curtain = self._show_paint_curtain()
         try:
-            self._update_toolbar_buttons()
-            self._refresh_view()
+            frozen = self._freeze_paint()
+            try:
+                self._update_toolbar_buttons()
+                self._refresh_view()
+            finally:
+                self._thaw_paint(frozen)
+            if curtain:
+                # update() 处理完 <Configure> 触发的二次 reflow 与全部
+                # Expose 绘制后返回，撤幕露出的即完整新帧
+                try:
+                    self.update()
+                except Exception:
+                    pass
         finally:
-            self._thaw_paint(frozen)
+            self._hide_paint_curtain(curtain)
 
     def _update_toolbar_buttons(self):
         """工具栏按钮按当前视图显隐：
@@ -2888,15 +2944,122 @@ class App(_TK_BASE):
         except Exception:
             pass
 
+    # 幕布窗口常量
+    _CURTAIN_STYLE = 0x80000000 | 0x10000000 | 0x0000000E  # WS_POPUP|WS_VISIBLE|SS_BITMAP
+    _CURTAIN_EXSTYLE = 0x08000000 | 0x00000080  # WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW
+    _STM_SETIMAGE = 0x0172
+    _SRCCOPY = 0x00CC0020
+
+    def _show_paint_curtain(self):
+        """截取客户区当前像素，用原生 Win32 STATIC 位图弹窗原位盖住。
+
+        防残影第三层（根治）。WM_SETREDRAW 冻结只解决了布局期间
+        SetWindowPos 的即时 bitblt 上屏；但解冻时 RedrawWindow(UPDATENOW)
+        发出的 WM_PAINT 在 Tk 里并不同步绘制——Tk 的窗口过程只是
+        BeginPaint/EndPaint 把区域 validate 掉、转成 Expose 事件排队，
+        真正的像素绘制要回到 mainloop 后逐 widget 在 idle 阶段完成。
+        因此解冻瞬间屏幕仍是定格的旧帧，新帧是随后逐块画上去的，
+        旧像素与新位置卡片混杂的窗口期依旧存在 → 残影未消。
+
+        幕布方案与绘制时序彻底解耦：切换前把客户区现有像素 BitBlt 进
+        内存位图，创建一个原生 STATIC(SS_BITMAP) 弹窗原位盖住客户区
+        （owner 为顶层 wrapper，天然压在本窗口之上；WS_EX_NOACTIVATE
+        不抢焦点；STATIC 在 WM_PAINT 里同步绘制，UpdateWindow 立即
+        上屏，与旧帧逐像素相同 → 盖上的瞬间无任何视觉变化）。DWM 下
+        被遮挡的窗口照常把新帧画进自己的合成表面，等切换与全部重绘
+        在幕布下做完再撤幕，露出的直接就是完整新帧。
+
+        返回 (幕布 hwnd, HBITMAP) 交给 _hide_paint_curtain；已有幕布
+        （嵌套）、窗口未映射或任何 Win32 调用失败时返回 None（调用方
+        退化为仅冻结方案）。"""
+        if self._curtain_active:
+            return None
+        # 本方法可能先于任何图标提取被调用（首次视图切换），argtypes
+        # 未声明时 CreateWindowExW 的 style（高位置位）会溢出 c_int
+        _init_win_apis()
+        user32 = ctypes.windll.user32
+        gdi32 = ctypes.windll.gdi32
+        hbm = None
+        try:
+            if not self.winfo_ismapped():
+                return None
+            hwnd = self.winfo_id()
+            w, h = int(self.winfo_width()), int(self.winfo_height())
+            x, y = int(self.winfo_rootx()), int(self.winfo_rooty())
+            if w <= 1 or h <= 1:
+                return None
+            # 1) 客户区当前像素 → 内存位图（DWM 重定向表面不受遮挡影响）
+            hdc = user32.GetDC(hwnd)
+            if not hdc:
+                return None
+            ok = 0
+            try:
+                mdc = gdi32.CreateCompatibleDC(hdc)
+                if not mdc:
+                    return None
+                try:
+                    hbm = gdi32.CreateCompatibleBitmap(hdc, w, h)
+                    if hbm:
+                        old = gdi32.SelectObject(mdc, hbm)
+                        ok = gdi32.BitBlt(mdc, 0, 0, w, h,
+                                          hdc, 0, 0, self._SRCCOPY)
+                        gdi32.SelectObject(mdc, old)
+                finally:
+                    gdi32.DeleteDC(mdc)
+            finally:
+                user32.ReleaseDC(hwnd, hdc)
+            if not (hbm and ok):
+                raise OSError("curtain capture failed")
+            # 2) 原生位图弹窗原位盖住客户区并立即同步上屏
+            owner = user32.GetParent(hwnd) or hwnd
+            hinst = ctypes.windll.kernel32.GetModuleHandleW(None)
+            cw = user32.CreateWindowExW(
+                self._CURTAIN_EXSTYLE, "STATIC", None, self._CURTAIN_STYLE,
+                x, y, w, h, owner, None, hinst, None)
+            if not cw:
+                raise OSError("curtain window failed")
+            user32.SendMessageW(cw, self._STM_SETIMAGE, 0, hbm)
+            user32.UpdateWindow(cw)
+            self._curtain_active = True
+            return (cw, hbm)
+        except Exception as e:
+            print(f"[QuickDeck] paint curtain fallback: {e!r}",
+                  file=sys.stderr)
+            if hbm:
+                try:
+                    gdi32.DeleteObject(hbm)
+                except Exception:
+                    pass
+            return None
+
+    def _hide_paint_curtain(self, curtain):
+        """撤幕并释放截屏位图。curtain 为 None（嵌套/失败）时不做任何事。"""
+        if not curtain:
+            return
+        self._curtain_active = False
+        cw, hbm = curtain
+        try:
+            ctypes.windll.user32.DestroyWindow(cw)
+        except Exception:
+            pass
+        try:
+            ctypes.windll.gdi32.DeleteObject(hbm)
+        except Exception:
+            pass
+
     def _refresh_view(self):
         """按 self.view_mode 重建列表区显示。
 
-        双层防残影：
-        1. _freeze_paint（Win32 层）——冻结屏幕更新，重建期间任何
-           SetWindowPos 都不上屏，解冻时整帧切换。根治重叠残影。
-        2. _view_switch_batch（Tcl 层）——抑制 _reflow / _reflow_flat
+        三层防残影：
+        1. _show_paint_curtain（根治）——截屏幕布盖住旧帧，重建与全部
+           重绘在幕布下完成，撤幕即完整新帧，与 Tk 异步绘制时序解耦。
+        2. _freeze_paint（Win32 层兜底）——冻结屏幕更新，重建期间
+           SetWindowPos 不上屏；幕布失败时仍消除布局中途的即时 bitblt。
+        3. _view_switch_batch（Tcl 层兜底）——抑制 _reflow / _reflow_flat
            内部的 update_idletasks，整个切换只在末尾 flush 一次几何。
-           非 Windows / 冻结失败时仍将中间帧数压到最少，作为兜底。"""
+        经 _on_view_mode_change 进入时幕布/冻结已由外层挂好，此处的
+        同名调用因嵌套标志直接跳过。"""
+        curtain = self._show_paint_curtain()
         frozen = self._freeze_paint()
         try:
             self._view_switch_batch = True
@@ -2940,8 +3103,21 @@ class App(_TK_BASE):
                 self._update_scrollregion()
             except Exception:
                 pass
+            # _update_scrollregion 改的 window item 高度要等 canvas 的
+            # idle 重排才落到 inner_frame 上，趁冻结把它也 flush 掉
+            try:
+                self.update_idletasks()
+            except Exception:
+                pass
         finally:
             self._thaw_paint(frozen)
+            if curtain:
+                # 幕布之下把 Expose 逐 widget 绘制与排队事件全部做完
+                try:
+                    self.update()
+                except Exception:
+                    pass
+            self._hide_paint_curtain(curtain)
 
     def _reflow_flat(self, cards):
         """把 cards 按 App.card_width 平铺 grid 进 flat_view。
