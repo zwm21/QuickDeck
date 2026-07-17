@@ -2215,6 +2215,7 @@ class App(_TK_BASE):
             self.add_btn.configure(state="disabled")
             self.multi_add_btn.configure(state="disabled")
             self.add_dir_btn.configure(state="disabled")
+            self.multi_add_dir_btn.configure(state="disabled")
             self.new_folder_btn.configure(state="disabled")
         else:
             self._load_from_config()
@@ -2510,6 +2511,15 @@ class App(_TK_BASE):
         )
         self.add_dir_btn.pack(side="left", padx=(8, 0))
 
+        self.multi_add_dir_btn = tk.Button(
+            toolbar, text="多选添加文件夹快捷方式",
+            font=self.app_font, command=self._on_multi_add_dir,
+            padx=10, pady=4,
+            bg=th["btn_bg"], fg=th["fg"],
+            activebackground=th["btn_active_bg"], activeforeground=th["fg"]
+        )
+        self.multi_add_dir_btn.pack(side="left", padx=(8, 0))
+
         self.open_dir_btn = tk.Button(
             toolbar, text="打开程序目录",
             font=self.app_font, command=self._on_open_app_dir,
@@ -2518,6 +2528,8 @@ class App(_TK_BASE):
             activebackground=th["btn_active_bg"], activeforeground=th["fg"]
         )
         self.open_dir_btn.pack(side="left", padx=(8, 0))
+        # 工具栏按钮按当前视图显隐（构建完成后立即按 cards 视图整理）
+        self._update_toolbar_buttons()
 
         # 可滚动列表
         list_wrap = tk.Frame(self, bg=th["app_bg"])
@@ -2695,7 +2707,8 @@ class App(_TK_BASE):
                                insertbackground=th["fg"],
                                buttonbackground=th["btn_bg"])
             for btn in (self.add_btn, self.multi_add_btn,
-                        self.new_folder_btn, self.open_dir_btn,
+                        self.new_folder_btn, self.add_dir_btn,
+                        self.multi_add_dir_btn, self.open_dir_btn,
                         self.card_width_arrow_up, self.card_width_arrow_dn):
                 btn.configure(bg=th["btn_bg"], fg=th["fg"],
                               activebackground=th["btn_active_bg"],
@@ -2752,7 +2765,38 @@ class App(_TK_BASE):
         if mode == self.view_mode:
             return
         self.view_mode = mode
+        self._update_toolbar_buttons()
         self._refresh_view()
+
+    def _update_toolbar_buttons(self):
+        """工具栏按钮按当前视图显隐：
+        cards：添加 / 多选添加 / 新建文件夹 / 打开程序目录；
+        usage：只留打开程序目录（临时只读视图，无添加语义）；
+        web：添加 / 多选添加 / 打开程序目录（文件对话框含 .url 过滤）；
+        dirs：添加文件夹快捷方式 / 多选添加文件夹快捷方式 / 打开程序目录。"""
+        visible = {
+            "cards": (self.add_btn, self.multi_add_btn,
+                      self.new_folder_btn, self.open_dir_btn),
+            "usage": (self.open_dir_btn,),
+            "web": (self.add_btn, self.multi_add_btn, self.open_dir_btn),
+            "dirs": (self.add_dir_btn, self.multi_add_dir_btn,
+                     self.open_dir_btn),
+        }.get(self.view_mode, (self.open_dir_btn,))
+        all_btns = (self.add_btn, self.multi_add_btn, self.new_folder_btn,
+                    self.add_dir_btn, self.multi_add_dir_btn,
+                    self.open_dir_btn)
+        for b in all_btns:
+            try:
+                b.pack_forget()
+            except tk.TclError:
+                pass
+        # 按固定顺序重新 pack，保证按钮排列稳定
+        first = True
+        for b in all_btns:
+            if b not in visible:
+                continue
+            b.pack(side="left", padx=(0 if first else 8, 0))
+            first = False
 
     def _flat_card_list(self):
         """当前平铺视图应显示的卡片列表。
@@ -2982,23 +3026,90 @@ class App(_TK_BASE):
         except Exception as e:
             messagebox.showerror("无法打开目录", f"{APP_DIR}\n\n{e}")
 
+    def _ask_delete_folder_target(self, folder, remaining):
+        """删除非空文件夹时的确认弹窗：可选卡片迁移的目标文件夹
+        （默认最后一个剩余文件夹）。返回目标 FolderFrame；取消返回 None。"""
+        th = self.theme
+        dlg = tk.Toplevel(self)
+        dlg.title("删除文件夹")
+        dlg.configure(bg=th["app_bg"], padx=16, pady=12)
+        dlg.resizable(False, False)
+        dlg.transient(self)
+
+        n = len(folder.cards)
+        tk.Label(
+            dlg, font=self.app_font, bg=th["app_bg"], fg=th["fg"],
+            justify="left", anchor="w",
+            text=(f"确定删除文件夹「{folder.name}」？\n\n"
+                  f"其中的 {n} 张快捷方式卡片不会被删除，\n"
+                  f"会移动到下方所选文件夹的末尾：")
+        ).pack(anchor="w")
+
+        # 目标选择：默认最后一个剩余文件夹（与旧行为一致）。
+        # 文件夹允许重名，Combobox 按下标回查而不是按名字
+        names = [f.name for f in remaining]
+        target_var = tk.StringVar(value=names[-1])
+        cb = ttk.Combobox(dlg, textvariable=target_var, values=names,
+                          state="readonly", width=24)
+        cb.current(len(names) - 1)
+        cb.pack(anchor="w", pady=(8, 0))
+
+        result = {"target": None}
+
+        def _ok():
+            idx = cb.current()
+            result["target"] = remaining[idx if idx >= 0 else -1]
+            dlg.destroy()
+
+        def _cancel():
+            dlg.destroy()
+
+        btn_row = tk.Frame(dlg, bg=th["app_bg"])
+        btn_row.pack(anchor="e", pady=(14, 0))
+        for text, cmd, danger in (("删除", _ok, True),
+                                  ("取消", _cancel, False)):
+            tk.Button(
+                btn_row, text=text, command=cmd, padx=14, pady=3,
+                font=self.app_font,
+                bg=th["btn_bg"],
+                fg=th["danger_fg"] if danger else th["fg"],
+                activebackground=(th["danger_active_bg"] if danger
+                                  else th["btn_active_bg"]),
+                activeforeground=th["danger_fg"] if danger else th["fg"],
+            ).pack(side="left", padx=(8, 0))
+
+        dlg.bind("<Return>", lambda e: _ok())
+        dlg.bind("<Escape>", lambda e: _cancel())
+        dlg.protocol("WM_DELETE_WINDOW", _cancel)
+
+        # 居中到主窗口，模态等待
+        dlg.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width()
+                                  - dlg.winfo_reqwidth()) // 2
+        y = self.winfo_rooty() + (self.winfo_height()
+                                  - dlg.winfo_reqheight()) // 3
+        dlg.geometry(f"+{max(0, x)}+{max(0, y)}")
+        dlg.grab_set()
+        cb.focus_set()
+        self.wait_window(dlg)
+        return result["target"]
+
     def delete_folder(self, folder):
         if len(self.folders) <= 1:
             messagebox.showinfo("提示", "至少保留一个文件夹。")
             return
-        # 卡片转移到最后一个剩余文件夹的末尾（"所有卡片队列末尾"）
         remaining = [f for f in self.folders if f is not folder]
-        target = remaining[-1] if remaining else None
-        # 删除前确认，说明后果（卡片不会丢，但会被移走）
         n = len(folder.cards)
-        if n > 0 and target is not None:
-            msg = (f"确定删除文件夹「{folder.name}」？\n\n"
-                   f"其中的 {n} 张快捷方式卡片不会被删除，"
-                   f"会移动到文件夹「{target.name}」的末尾。")
+        if n > 0:
+            # 非空文件夹：弹窗内可自选卡片迁移目标（默认最后一个剩余文件夹）
+            target = self._ask_delete_folder_target(folder, remaining)
+            if target is None:
+                return
         else:
-            msg = f"确定删除空文件夹「{folder.name}」？"
-        if not messagebox.askyesno("删除文件夹", msg):
-            return
+            target = None
+            if not messagebox.askyesno(
+                    "删除文件夹", f"确定删除空文件夹「{folder.name}」？"):
+                return
         moved = list(folder.cards)
         folder.cards = []  # 清空源文件夹，但不销毁卡片本身
         if target is not None:
@@ -3056,6 +3167,98 @@ class App(_TK_BASE):
         # askdirectory 返回正斜杠路径，统一成 Windows 风格
         path = os.path.normpath(path)
         if self._add_card(path, ""):
+            self.save_state()
+
+    def _pick_multiple_dirs(self):
+        """系统 IFileOpenDialog（FOS_PICKFOLDERS + FOS_ALLOWMULTISELECT）
+        多选目录。tkinter 的 askdirectory 不支持多选，而本机 pywin32
+        的 shell 模块没有 IFileOpenDialog 包装，直接用 ctypes 走 COM
+        vtable（与 imagefactory_icon 同一套调用方式）。
+        返回路径列表；用户取消返回空列表；不可用时抛异常由调用方兜底。"""
+        _ensure_com()
+        ole32 = ctypes.windll.ole32
+
+        def method(ptr, idx, *argtypes):
+            """取 COM 对象 vtable 第 idx 个方法（返回 HRESULT）。"""
+            vtbl = ctypes.cast(
+                ptr, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))
+            ).contents
+            return ctypes.WINFUNCTYPE(
+                ctypes.c_long, ctypes.c_void_p, *argtypes)(vtbl[idx])
+
+        dlg = ctypes.c_void_p()
+        hr = ole32.CoCreateInstance(
+            ctypes.byref(_iid("{DC1C5A9C-E88A-4DDE-A5A1-60F82A20AEF7}")),
+            None, 1,  # CLSCTX_INPROC_SERVER
+            ctypes.byref(_iid("{D57C7288-D4AD-4768-BE02-9D969532D960}")),
+            ctypes.byref(dlg))  # CLSID / IID_IFileOpenDialog
+        if hr != 0 or not dlg.value:
+            raise OSError(f"CoCreateInstance(FileOpenDialog) hr={hr:#010x}")
+        items = ctypes.c_void_p()
+        paths = []
+        try:
+            # IFileDialog::GetOptions(10) / SetOptions(9)：
+            # FOS_PICKFOLDERS(0x20) | FOS_FORCEFILESYSTEM(0x40)
+            # | FOS_ALLOWMULTISELECT(0x200)
+            opts = ctypes.c_ulong()
+            method(dlg, 10, ctypes.POINTER(ctypes.c_ulong))(
+                dlg, ctypes.byref(opts))
+            method(dlg, 9, ctypes.c_ulong)(
+                dlg, opts.value | 0x20 | 0x40 | 0x200)
+            # IFileDialog::SetTitle(17)
+            method(dlg, 17, ctypes.c_wchar_p)(dlg, "选择多个要添加的文件夹")
+            # IModalWindow::Show(3)：模态；用户取消返回
+            # HRESULT_FROM_WIN32(ERROR_CANCELLED)，非 0 一律视为取消
+            hr = method(dlg, 3, ctypes.c_void_p)(dlg, self.winfo_id())
+            if hr != 0:
+                return []
+            # IFileOpenDialog::GetResults(27) → IShellItemArray
+            hr = method(dlg, 27, ctypes.POINTER(ctypes.c_void_p))(
+                dlg, ctypes.byref(items))
+            if hr != 0 or not items.value:
+                return []
+            # IShellItemArray::GetCount(7) / GetItemAt(8)
+            count = ctypes.c_ulong()
+            method(items, 7, ctypes.POINTER(ctypes.c_ulong))(
+                items, ctypes.byref(count))
+            for i in range(count.value):
+                item = ctypes.c_void_p()
+                hr = method(items, 8, ctypes.c_ulong,
+                            ctypes.POINTER(ctypes.c_void_p))(
+                    items, i, ctypes.byref(item))
+                if hr != 0 or not item.value:
+                    continue
+                try:
+                    # IShellItem::GetDisplayName(5, SIGDN_FILESYSPATH)
+                    pw = ctypes.c_wchar_p()
+                    hr = method(item, 5, ctypes.c_ulong,
+                                ctypes.POINTER(ctypes.c_wchar_p))(
+                        item, 0x80058000, ctypes.byref(pw))
+                    if hr == 0 and pw.value:
+                        paths.append(os.path.normpath(pw.value))
+                        ole32.CoTaskMemFree(pw)
+                finally:
+                    _com_release(item)
+            return paths
+        finally:
+            _com_release(items)
+            _com_release(dlg)
+
+    def _on_multi_add_dir(self):
+        """多选目录加入文件夹快捷方式独立存储区。"""
+        try:
+            paths = self._pick_multiple_dirs()
+        except Exception as e:
+            # COM 对话框不可用：退回单选 askdirectory
+            print(f"[QuickDeck] multi dir dialog fallback: {e}",
+                  file=sys.stderr)
+            self._on_add_dir()
+            return
+        added = 0
+        for p in paths:
+            if self._add_card(p, ""):
+                added += 1
+        if added:
             self.save_state()
 
     @staticmethod
