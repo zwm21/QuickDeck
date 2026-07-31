@@ -16,6 +16,7 @@ import uuid
 import queue
 import ctypes
 import hashlib
+import weakref
 import threading
 import subprocess
 import tkinter as tk
@@ -51,6 +52,9 @@ from quickdeck.platform.win32_icons import (
     resolve_shortcut, get_icon_for_file, get_title_for_file,
     make_default_icon, _ensure_com, _init_win_apis, _iid, _com_release,
 )
+# ---- 重构 P2：图标缓存/异步加载已拆分到 quickdeck.services ----
+from quickdeck.services.icon_cache import IconCache
+from quickdeck.services.icon_loader import IconLoader
 
 
 # ================================================================
@@ -532,80 +536,12 @@ def save_config(cfg):
 
 
 # ================================================================
-# 图标缓存（内存 dict + 磁盘 PNG，key = 规范化路径 + mtime）
+# 图标缓存（重构 P2：实现移至 quickdeck.services.icon_cache）
 # ================================================================
-_icon_mem_cache = {}
-_icon_cache_lock = threading.Lock()
-
-
-def _icon_cache_key(path):
-    """(规范化绝对路径, mtime_ns)；文件不存在时 mtime 记 0。
-    mtime 进 key 保证快捷方式被替换/更新后缓存自动失效。"""
-    p = os.path.normcase(os.path.abspath(path))
-    try:
-        mtime = os.stat(p).st_mtime_ns
-    except OSError:
-        mtime = 0
-    return p, mtime
-
-
-def _icon_cache_file(key):
-    name = hashlib.sha1(
-        f"{key[0]}|{key[1]}".encode("utf-8", "replace")).hexdigest()
-    return os.path.join(
-        os.path.dirname(ACTIVE_CONFIG_FILE), "icon_cache", name + ".png")
-
-
-def icon_cache_get(path):
-    """先查内存，再查磁盘 PNG（磁盘命中会回填内存）。未命中返回 None。"""
-    key = _icon_cache_key(path)
-    with _icon_cache_lock:
-        pil = _icon_mem_cache.get(key)
-    if pil is not None:
-        return pil
-    fp = _icon_cache_file(key)
-    try:
-        if os.path.exists(fp):
-            img = Image.open(fp)
-            img.load()
-            if img.mode != "RGBA":
-                img = img.convert("RGBA")
-            with _icon_cache_lock:
-                _icon_mem_cache[key] = img
-            return img
-    except Exception as e:
-        print(f"[QuickDeck] icon cache read failed: {e}", file=sys.stderr)
-    return None
-
-
-def icon_cache_put(path, pil):
-    """写内存 + 磁盘。磁盘写失败只打日志（缓存是加速手段，不是功能依赖）。"""
-    key = _icon_cache_key(path)
-    with _icon_cache_lock:
-        _icon_mem_cache[key] = pil
-    fp = _icon_cache_file(key)
-    try:
-        os.makedirs(os.path.dirname(fp), exist_ok=True)
-        pil.save(fp, "PNG")
-    except Exception as e:
-        print(f"[QuickDeck] icon cache write failed: {e}", file=sys.stderr)
-
-
-def icon_cache_remove(path):
-    """删除该路径当前 key 的内存 + 磁盘缓存条目（右键"刷新图标"用）。
-
-    覆盖缓存盲区：key 含 mtime，但 .lnk 指向的目标 exe 升级换图标时
-    .lnk 本身的 mtime 不变，缓存 key 相同导致永远命中陈旧图标——
-    删掉条目后重新提取即可拿到新图标。"""
-    key = _icon_cache_key(path)
-    with _icon_cache_lock:
-        _icon_mem_cache.pop(key, None)
-    fp = _icon_cache_file(key)
-    try:
-        if os.path.exists(fp):
-            os.remove(fp)
-    except OSError as e:
-        print(f"[QuickDeck] icon cache remove failed: {e}", file=sys.stderr)
+# 缓存目录在启动时按选定的配置路径固定下来（旧实现动态跟随
+# ACTIVE_CONFIG_FILE，save 降级后缓存目录会漂移，属历史 bug）
+ICON_CACHE = IconCache(
+    os.path.join(os.path.dirname(ACTIVE_CONFIG_FILE), "icon_cache"))
 
 
 # ================================================================
@@ -644,7 +580,7 @@ class ShortcutCard(tk.Frame):
         if self.custom_icon:
             pil = self._load_icon_file(self.custom_icon)
         if pil is None and HAS_WIN32:
-            pil = icon_cache_get(path)
+            pil = ICON_CACHE.get(path)
         if pil is None:
             pil = app.default_icon_img
             pending_async = HAS_WIN32
@@ -832,7 +768,7 @@ class ShortcutCard(tk.Frame):
         解决"目标应用升级后卡片仍显示旧图标"（缓存 key 的 mtime 盲区）。"""
         if self.custom_icon or not HAS_WIN32:
             return
-        icon_cache_remove(self.path)
+        ICON_CACHE.remove(self.path)
         # 先回落占位图标，提取完成后由主线程轮询回填
         if self.app.default_icon_img is not None:
             self.set_extracted_icon(self.app.default_icon_img)
@@ -1403,16 +1339,15 @@ class App(_TK_BASE):
         # （_on_view_mode_change 与其内部的 _refresh_view 各有入口）
         self._curtain_active = False
 
-        # 图标异步提取：worker 线程从 _icon_queue 取任务，
-        # 提取结果放 _icon_results，由主线程定时轮询回填
-        # （不在 worker 里直接碰 tk——tkinter 跨线程调用不安全）
-        self._icon_queue = queue.Queue()
-        self._icon_results = queue.Queue()
-        self._icon_worker = threading.Thread(
-            target=self._icon_worker_main, daemon=True,
-            name="QuickDeckIconWorker")
-        self._icon_worker.start()
+        # 图标异步提取（重构 P2：IconLoader 服务）：
+        # 队列只传 (task_id, path, size) 纯数据，卡片经 WeakValueDictionary
+        # 按 task_id 回填——已销毁的卡片自动失联，不再被队列引用拖住
+        self._icon_loader = IconLoader(
+            get_icon_for_file, ICON_CACHE, prepare=_ensure_com)
+        self._icon_cards = weakref.WeakValueDictionary()
+        self._icon_task_seq = 0
         self.after(120, self._poll_icon_results)
+        ICON_CACHE.start_gc()
 
         self._build_ui()
         self._apply_style_font()
@@ -1460,43 +1395,27 @@ class App(_TK_BASE):
     # 图标异步提取
     # ============================================================
     def request_icon(self, card):
-        """把卡片入队，由 worker 线程提取真实图标。"""
-        self._icon_queue.put(card)
-
-    def _icon_worker_main(self):
-        """worker 线程主循环：提取图标 → 写缓存 → 结果入队。
-        只读 card.path（str，不可变），不触碰任何 tk 对象。"""
-        _ensure_com()  # per-thread COM 初始化（thread-local 记录）
-        while True:
-            card = self._icon_queue.get()
-            if card is None:  # 预留退出信号
-                break
-            try:
-                path = card.path
-                pil = icon_cache_get(path)
-                if pil is None:
-                    pil = get_icon_for_file(path)
-                    if pil is not None:
-                        icon_cache_put(path, pil)
-                if pil is not None:
-                    self._icon_results.put((card, pil))
-            except Exception as e:
-                print(f"[QuickDeck] icon worker error: {e}",
-                      file=sys.stderr)
+        """登记弱引用并把 (task_id, path, size) 纯数据入队异步提取。"""
+        self._icon_task_seq += 1
+        task_id = self._icon_task_seq
+        self._icon_cards[task_id] = card
+        self._icon_loader.submit(task_id, card.path, ICON_SIZE)
 
     def _poll_icon_results(self):
-        """主线程轮询提取结果，回填到仍然存活的卡片上。"""
-        try:
-            while True:
-                card, pil = self._icon_results.get_nowait()
-                try:
-                    if card.winfo_exists():
-                        card.set_extracted_icon(pil)
-                except tk.TclError:
-                    pass  # 卡片已销毁
-        except queue.Empty:
-            pass
-        self.after(120, self._poll_icon_results)
+        """主线程轮询提取结果，回填到仍然存活的卡片上。
+        节奏自适应：有结果/有积压时 60ms，空闲时 250ms。"""
+        results = self._icon_loader.drain()
+        for task_id, pil in results:
+            card = self._icon_cards.pop(task_id, None)
+            if card is None:
+                continue  # 卡片已销毁（弱引用失效）
+            try:
+                if card.winfo_exists():
+                    card.set_extracted_icon(pil)
+            except tk.TclError:
+                pass
+        delay = 60 if (results or self._icon_loader.pending()) else 250
+        self.after(delay, self._poll_icon_results)
 
     # ============================================================
     # 文件拖放
@@ -3309,6 +3228,7 @@ class App(_TK_BASE):
     def _on_close(self):
         try:
             self.save_state()
+            self._icon_loader.stop(timeout=1.0)
         finally:
             self.destroy()
 
