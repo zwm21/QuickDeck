@@ -55,6 +55,10 @@ from quickdeck.platform.win32_icons import (
 # ---- 重构 P2：图标缓存/异步加载已拆分到 quickdeck.services ----
 from quickdeck.services.icon_cache import IconCache
 from quickdeck.services.icon_loader import IconLoader
+# ---- 重构 P3：配置层已拆分到 quickdeck.config ----
+from quickdeck.constants import ICON_SIZE, BUILTIN_FONT_FAMILY
+from quickdeck.config.schema import DEFAULT_CONFIG, default_config
+from quickdeck.config.store import ConfigStore
 
 
 # ================================================================
@@ -88,61 +92,10 @@ APPDATA_DIR = os.path.join(
 )
 APPDATA_CONFIG_FILE = os.path.join(APPDATA_DIR, "config.json")
 
+# 重构 P3：路径选择 / 原子写 / 损坏恢复移至 quickdeck.config.store
+CONFIG_STORE = ConfigStore(CONFIG_FILE, APPDATA_CONFIG_FILE)
 
-def _dir_writable(d):
-    """探测目录是否真的可写（Program Files 下 os.access 不可靠）。"""
-    try:
-        probe = os.path.join(d, ".qd_write_test")
-        with open(probe, "w") as f:
-            f.write("x")
-        os.remove(probe)
-        return True
-    except OSError:
-        return False
-
-
-def _select_config_file():
-    """Portable 优先：exe 目录存在 config.json 或目录可写 → 用 exe 目录；
-    否则降级到 %APPDATA%/QuickDeck/config.json。"""
-    # 两处都存在时优先 exe 目录（Portable 语义）
-    if os.path.exists(CONFIG_FILE):
-        return CONFIG_FILE
-    if os.path.exists(APPDATA_CONFIG_FILE):
-        # exe 目录没有配置但 APPDATA 有 → 曾经降级过，继续用 APPDATA
-        return APPDATA_CONFIG_FILE
-    # 都不存在：首次运行，按可写性决定落点
-    if _dir_writable(APP_DIR):
-        return CONFIG_FILE
-    try:
-        os.makedirs(APPDATA_DIR, exist_ok=True)
-    except OSError:
-        pass
-    return APPDATA_CONFIG_FILE
-
-
-# ACTIVE_CONFIG_FILE 是本次运行实际使用的配置路径；save_config 写失败时
-# 会自动切到 APPDATA 再试一次并更新它
-ACTIVE_CONFIG_FILE = _select_config_file()
 LOCAL_FONT_FILE = _resource_path("HYWenHei-65W.ttf")
-
-# 内置字体家族名（TTF 文件内 name table 记录的家族名，
-# 通常与去掉扩展名的文件名一致）
-BUILTIN_FONT_FAMILY = "HYWenHei-65W"
-
-ICON_SIZE = 32  # 卡片上显示的图标像素尺寸
-
-DEFAULT_CONFIG = {
-    "window": {"width": 900, "height": 650, "x": 200, "y": 100},
-    "font": {"family": BUILTIN_FONT_FAMILY, "size": 12},
-    "card_width": 500,
-    "theme_mode": "system",  # "system" | "light" | "dark"
-    "shortcuts": [],
-    # 网页快捷方式独立存储区（.url 不进文件夹，在"网页快捷方式"视图中管理）
-    "web_shortcuts": [],
-    # 文件夹快捷方式独立存储区（目录路径不进文件夹分组，
-    # 在"文件夹快捷方式"视图中管理，双击在资源管理器中打开）
-    "dir_shortcuts": []
-}
 
 
 # ================================================================
@@ -186,362 +139,58 @@ DARK_THEME = {
 
 
 # ================================================================
-# 配置读写
+# 配置读写（重构 P3：实现移至 quickdeck.config；此处仅保留 UI 包装）
 # ================================================================
-def _cfg_paths(cfg_file):
-    """由主配置路径派生 bak/tmp/corrupt 三个伴生路径。"""
-    return cfg_file + ".bak", cfg_file + ".tmp", cfg_file + ".corrupt"
-
-
-# 兼容旧引用（基于启动时选中的路径；save_config 降级后以
-# ACTIVE_CONFIG_FILE 的派生为准）
-CONFIG_BAK_FILE, CONFIG_TMP_FILE, CONFIG_CORRUPT_FILE = \
-    _cfg_paths(ACTIVE_CONFIG_FILE)
-
-# _merge_dict 允许的最大递归深度：正常配置最多 3-4 层嵌套，
-# 32 层已远超合理值；超过即视为恶意构造或损坏，停止递归以防栈溢出。
-_MERGE_MAX_DEPTH = 32
-
-
-def _merge_dict(base, override, depth=0):
-    """把 override 的字段递归合并到 base，保证 base 拥有完整结构。
-
-    - depth 超过 _MERGE_MAX_DEPTH 时不再递归，直接用 override 覆盖，
-      避免构造超深嵌套的 JSON 触发 RecursionError。
-    - override 不是 dict 时也直接返回 base（防御 _sanitize 前的调用者）。
+def load_config():
+    """从 CONFIG_STORE 加载配置，把加载事件转成用户弹窗（保持旧交互）：
+    - 主文件损坏、已用 .bak 恢复 -> showwarning 告知
+    - 主文件与 .bak 都不可用 -> askyesno 让用户在"隔离坏文件并用默认值
+      继续"与"退出检查文件"之间选择
     """
-    if depth >= _MERGE_MAX_DEPTH or not isinstance(override, dict):
-        return override if isinstance(override, dict) else base
-    for k, v in override.items():
-        if isinstance(v, dict) and isinstance(base.get(k), dict):
-            base[k] = _merge_dict(base[k], v, depth + 1)
-        else:
-            base[k] = v
-    return base
-
-
-def _sanitize_config(cfg):
-    """加载后逐字段做类型/范围校验，非法值就地回落到默认，返回 cfg 本身。
-
-    load_config 走 _merge_dict 后所有字段仍可能被用户手改成任意类型，
-    这里把它们统一约束到 GUI 期望的形态，避免 App.__init__ / 加载卡片
-    / sorted key 等地方直接 raise 导致启动失败或卡片全部丢失。
-    """
-    if not isinstance(cfg, dict):
-        return copy.deepcopy(DEFAULT_CONFIG)
-
-    # ---- window ----
-    default_w = DEFAULT_CONFIG["window"]
-    w = cfg.get("window")
-    if not isinstance(w, dict):
-        w = {}
-    def _int_or(default, val, lo=None, hi=None):
-        try:
-            v = int(val)
-        except (TypeError, ValueError):
-            return default
-        if lo is not None and v < lo:
-            v = lo
-        if hi is not None and v > hi:
-            v = hi
-        return v
-    cfg["window"] = {
-        "width": _int_or(default_w["width"], w.get("width"),
-                         lo=100, hi=20000),
-        "height": _int_or(default_w["height"], w.get("height"),
-                          lo=100, hi=20000),
-        # x/y 允许负值（多显示器左侧屏），范围放宽；越界最终会在
-        # App.__init__ 里按当前屏幕再兜底一次
-        "x": _int_or(default_w["x"], w.get("x"), lo=-20000, hi=20000),
-        "y": _int_or(default_w["y"], w.get("y"), lo=-20000, hi=20000),
-    }
-
-    # ---- font ----
-    default_f = DEFAULT_CONFIG["font"]
-    f = cfg.get("font")
-    if not isinstance(f, dict):
-        f = {}
-    fam = f.get("family")
-    if not isinstance(fam, str) or not fam.strip():
-        fam = default_f["family"]
-    cfg["font"] = {
-        "family": fam,
-        "size": _int_or(default_f["size"], f.get("size"), lo=8, hi=36),
-    }
-
-    # ---- card_width ----
-    cfg["card_width"] = _int_or(
-        DEFAULT_CONFIG["card_width"], cfg.get("card_width"),
-        lo=200, hi=1200
-    )
-
-    # ---- theme_mode ----
-    tm = cfg.get("theme_mode")
-    if tm not in ("system", "light", "dark"):
-        tm = "system"
-    cfg["theme_mode"] = tm
-
-    # ---- folders ----
-    raw_folders = cfg.get("folders")
-    clean_folders = []
-    if isinstance(raw_folders, list):
-        for i, fd in enumerate(raw_folders):
-            if not isinstance(fd, dict):
-                continue
-            fid = fd.get("id")
-            if not isinstance(fid, str) or not fid.strip():
-                fid = "f_" + uuid.uuid4().hex[:8]
-            name = fd.get("name")
-            if not isinstance(name, str) or not name.strip():
-                name = "未命名"
-            order = _int_or(i, fd.get("order"), lo=-10**9, hi=10**9)
-            locked = bool(fd.get("locked"))
-            collapsed = bool(fd.get("collapsed"))
-            clean_folders.append({
-                "id": fid, "name": name,
-                "order": order, "locked": locked,
-                "collapsed": collapsed,
-            })
-    cfg["folders"] = clean_folders  # 允许为空，_load_from_config 会兜底建默认
-
-    # ---- shortcuts ----
-    raw_items = cfg.get("shortcuts")
-    clean_items = []
-    if isinstance(raw_items, list):
-        for i, it in enumerate(raw_items):
-            if not isinstance(it, dict):
-                continue
-            p = it.get("path")
-            if not isinstance(p, str) or not p:
-                continue
-            desc = it.get("description", "")
-            if not isinstance(desc, str):
-                desc = ""
-            fid = it.get("folder")
-            if not isinstance(fid, str) or not fid:
-                fid = ""
-            order = _int_or(i, it.get("order"), lo=-10**9, hi=10**9)
-            title = it.get("title", "")
-            if not isinstance(title, str):
-                title = ""
-            icon = it.get("icon", "")
-            if not isinstance(icon, str):
-                icon = ""
-            lc = _int_or(0, it.get("launch_count"), lo=0, hi=10**9)
+    cfg, notices = CONFIG_STORE.load()
+    for n in notices:
+        if n["kind"] == "restored_from_bak":
             try:
-                ts = float(it.get("last_launch_ts", 0.0))
-            except (TypeError, ValueError):
-                ts = 0.0
-            if ts < 0:
-                ts = 0.0
-            clean_items.append({
-                "path": p, "description": desc,
-                "folder": fid, "order": order,
-                "title": title, "icon": icon,
-                "launch_count": lc, "last_launch_ts": ts,
-            })
-    cfg["shortcuts"] = clean_items
-
-    # ---- 独立存储区（web_shortcuts / dir_shortcuts，
-    #      与 shortcuts 同构但无 folder 字段） ----
-    for area_key in ("web_shortcuts", "dir_shortcuts"):
-        raw_area = cfg.get(area_key)
-        clean_area = []
-        if isinstance(raw_area, list):
-            for i, it in enumerate(raw_area):
-                if not isinstance(it, dict):
-                    continue
-                p = it.get("path")
-                if not isinstance(p, str) or not p:
-                    continue
-                desc = it.get("description", "")
-                if not isinstance(desc, str):
-                    desc = ""
-                order = _int_or(i, it.get("order"), lo=-10**9, hi=10**9)
-                title = it.get("title", "")
-                if not isinstance(title, str):
-                    title = ""
-                icon = it.get("icon", "")
-                if not isinstance(icon, str):
-                    icon = ""
-                lc = _int_or(0, it.get("launch_count"), lo=0, hi=10**9)
-                try:
-                    ts = float(it.get("last_launch_ts", 0.0))
-                except (TypeError, ValueError):
-                    ts = 0.0
-                if ts < 0:
-                    ts = 0.0
-                clean_area.append({
-                    "path": p, "description": desc, "order": order,
-                    "title": title, "icon": icon,
-                    "launch_count": lc, "last_launch_ts": ts,
-                })
-        cfg[area_key] = clean_area
-
+                messagebox.showwarning(
+                    "配置文件损坏",
+                    "config.json 无法解析，已隔离为 config.json.corrupt，"
+                    "并使用最近一次成功保存的备份 config.json.bak 恢复。"
+                )
+            except Exception:
+                pass
+        elif n["kind"] == "unrecoverable":
+            bak_err = n.get("bak_err")
+            try:
+                choice = messagebox.askyesno(
+                    "配置文件损坏",
+                    "config.json 无法解析，且没有可用的 .bak 备份。\n\n"
+                    f"主文件错误：{n['primary_err']}\n"
+                    + (f"备份错误：{bak_err}\n" if bak_err else "")
+                    + "\n是（Yes）：备份坏文件为 config.json.corrupt "
+                    "并使用默认设置继续启动。"
+                    "\n否（No）：立即退出程序，让你手动检查文件。"
+                )
+            except Exception:
+                choice = True  # 无 GUI 环境时默认继续
+            if not choice:
+                sys.exit(1)
+            CONFIG_STORE.isolate_corrupt()
+            cfg = default_config()
     return cfg
 
 
-def _read_config_file(path):
-    """读取并合并到默认结构；失败时抛异常。"""
-    cfg = copy.deepcopy(DEFAULT_CONFIG)
-    with open(path, "r", encoding="utf-8") as f:
-        loaded = json.load(f)
-    if not isinstance(loaded, dict):
-        raise ValueError("config root is not a JSON object")
-    cfg = _merge_dict(cfg, loaded)
-    return _sanitize_config(cfg)
-
-
-def load_config():
-    """从 ACTIVE_CONFIG_FILE 加载配置。
-
-    - 文件不存在：返回默认。
-    - 加载失败：先隔离坏文件到 *.corrupt，再尝试 .bak；
-      两个都不行时用 messagebox 让用户在"备份坏文件并使用默认" /
-      "退出程序检查文件" 之间选择，避免下次 save 无声覆盖坏数据。
-    """
-    cfg_file = ACTIVE_CONFIG_FILE
-    bak_file, _tmp, corrupt_file = _cfg_paths(cfg_file)
-
-    if not os.path.exists(cfg_file):
-        # 主文件缺失但有 .bak，尝试恢复
-        if os.path.exists(bak_file):
-            try:
-                return _read_config_file(bak_file)
-            except Exception as e:
-                print(f"[QuickDeck] load bak fallback failed: {e}",
-                      file=sys.stderr)
-        return _sanitize_config(copy.deepcopy(DEFAULT_CONFIG))
-
-    try:
-        return _read_config_file(cfg_file)
-    except Exception as primary_err:
-        print(f"[QuickDeck] load_config primary error: {primary_err}",
-              file=sys.stderr)
-
-    # 主文件读取失败：尝试 .bak
-    bak_cfg = None
-    bak_err = None
-    if os.path.exists(bak_file):
-        try:
-            bak_cfg = _read_config_file(bak_file)
-        except Exception as e:
-            bak_err = e
-            print(f"[QuickDeck] load_config bak error: {e}",
-                  file=sys.stderr)
-
-    # 有可用 .bak：把损坏主文件挪走 → 用 .bak 覆盖 → 使用 .bak
-    if bak_cfg is not None:
-        try:
-            os.replace(cfg_file, corrupt_file)
-        except Exception:
-            pass
-        # 弹窗告知，避免用户以为一切正常
-        try:
-            messagebox.showwarning(
-                "配置文件损坏",
-                "config.json 无法解析，已隔离为 config.json.corrupt，"
-                "并使用最近一次成功保存的备份 config.json.bak 恢复。"
-            )
-        except Exception:
-            pass
-        return bak_cfg
-
-    # .bak 也不可用：询问用户
-    try:
-        choice = messagebox.askyesno(
-            "配置文件损坏",
-            "config.json 无法解析，且没有可用的 .bak 备份。\n\n"
-            f"主文件错误：{primary_err}\n"
-            + (f"备份错误：{bak_err}\n" if bak_err else "")
-            + "\n是（Yes）：备份坏文件为 config.json.corrupt 并使用默认设置继续启动。"
-            "\n否（No）：立即退出程序，让你手动检查文件。"
-        )
-    except Exception:
-        choice = True  # 无 GUI 环境时默认继续
-    if not choice:
-        sys.exit(1)
-    try:
-        os.replace(cfg_file, corrupt_file)
-    except Exception:
-        pass
-    return _sanitize_config(copy.deepcopy(DEFAULT_CONFIG))
-
-
-def _write_config_to(cfg, cfg_file):
-    """把 cfg 原子写到 cfg_file（tmp + fsync + os.replace + bak 轮转）。
-    失败时抛异常（由 save_config 决定是否降级重试）。"""
-    bak_file, tmp_file, _corrupt = _cfg_paths(cfg_file)
-    d = os.path.dirname(cfg_file)
-    if d and not os.path.isdir(d):
-        os.makedirs(d, exist_ok=True)
-    # 1) 写临时文件；先 flush + fsync 保证内容真的到磁盘再 rename
-    with open(tmp_file, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, ensure_ascii=False, indent=2)
-        try:
-            f.flush()
-            os.fsync(f.fileno())
-        except (OSError, AttributeError):
-            pass
-    # 2) 先把当前主文件挪到 .bak（保留上次成功的完整版本），
-    #    然后把 tmp 原子替换为主文件
-    if os.path.exists(cfg_file):
-        try:
-            os.replace(cfg_file, bak_file)
-        except OSError as e:
-            print(f"[QuickDeck] backup rotate failed: {e}",
-                  file=sys.stderr)
-    os.replace(tmp_file, cfg_file)
-
-
 def save_config(cfg):
-    """原子写回配置。
-
-    Portable 优先：先写 ACTIVE_CONFIG_FILE（初始为 exe 目录，除非启动时
-    已降级）。写失败（如 exe 在 Program Files、权限不足）时自动降级到
-    %APPDATA%/QuickDeck/config.json 再试一次，并把 ACTIVE_CONFIG_FILE
-    永久切过去，本次会话后续保存都直接走 APPDATA。
-    """
-    global ACTIVE_CONFIG_FILE
-    try:
-        _write_config_to(cfg, ACTIVE_CONFIG_FILE)
-        return
-    except Exception as e:
-        print(f"[QuickDeck] save_config error at "
-              f"{ACTIVE_CONFIG_FILE}: {e}", file=sys.stderr)
-        # 清理可能残留的 tmp，避免下次干扰
-        _b, tmp_file, _c = _cfg_paths(ACTIVE_CONFIG_FILE)
-        try:
-            if os.path.exists(tmp_file):
-                os.remove(tmp_file)
-        except OSError:
-            pass
-
-    # 已经在 APPDATA 还失败：没有更低的降级层，放弃本次保存
-    if os.path.normcase(ACTIVE_CONFIG_FILE) == \
-            os.path.normcase(APPDATA_CONFIG_FILE):
-        return
-
-    # 降级 APPDATA 重试
-    try:
-        _write_config_to(cfg, APPDATA_CONFIG_FILE)
-        ACTIVE_CONFIG_FILE = APPDATA_CONFIG_FILE
-        print(f"[QuickDeck] config fell back to {APPDATA_CONFIG_FILE}",
-              file=sys.stderr)
-    except Exception as e:
-        print(f"[QuickDeck] save_config appdata fallback error: {e}",
-              file=sys.stderr)
-
-
+    """原子写回配置（测试通过 monkeypatch 本函数拦截写盘）。"""
+    CONFIG_STORE.save(cfg)
 
 
 # ================================================================
 # 图标缓存（重构 P2：实现移至 quickdeck.services.icon_cache）
 # ================================================================
 # 缓存目录在启动时按选定的配置路径固定下来（旧实现动态跟随
-# ACTIVE_CONFIG_FILE，save 降级后缓存目录会漂移，属历史 bug）
+# 活动配置路径，save 降级后缓存目录会漂移，属历史 bug）
 ICON_CACHE = IconCache(
-    os.path.join(os.path.dirname(ACTIVE_CONFIG_FILE), "icon_cache"))
+    os.path.join(os.path.dirname(CONFIG_STORE.active_file), "icon_cache"))
 
 
 # ================================================================
