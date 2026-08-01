@@ -59,6 +59,8 @@ from quickdeck.services.icon_loader import IconLoader
 from quickdeck.constants import ICON_SIZE, BUILTIN_FONT_FAMILY
 from quickdeck.config.schema import DEFAULT_CONFIG, default_config
 from quickdeck.config.store import ConfigStore
+# ---- 重构 P4：数据层（widget 只作渲染，业务数据在纯数据类） ----
+from quickdeck.model.workspace import Shortcut, Folder
 
 
 # ================================================================
@@ -204,20 +206,17 @@ class ShortcutCard(tk.Frame):
     # 兼容旧引用；实际生效值走 App.card_width（可由 UI 实时调整）
     CARD_WIDTH = 500
 
-    def __init__(self, master, app, path, description="",
-                 custom_title="", custom_icon="",
-                 launch_count=0, last_launch_ts=0.0):
+    def __init__(self, master, app, item):
+        """item: quickdeck.model.workspace.Shortcut——卡片的业务数据
+        全部存于纯数据对象（重构 P4），widget 属性仅作 property 转发。"""
         th = app.theme
         super().__init__(master, bd=1, relief="solid",
                          padx=8, pady=6, bg=th["card_bg"])
         self.app = app
-        self.path = path
+        self.item = item
         self.folder = None  # 由 FolderFrame.add_card / insert_card 设置
-        self.custom_title = custom_title or ""
-        self.custom_icon = custom_icon or ""
-        # 使用统计（"按使用排序"视图的排序依据；随 config 持久化）
-        self.launch_count = max(0, int(launch_count or 0))
-        self.last_launch_ts = max(0.0, float(last_launch_ts or 0.0))
+        path = item.path
+        description = item.description
 
         # 图标：
         #   1) 自定义图标文件 → 同步加载（本地图像，开销小）
@@ -257,10 +256,8 @@ class ShortcutCard(tk.Frame):
                                    insertbackground=th["fg"],
                                    readonlybackground=th["desc_bg"])
         self.desc_entry.pack(fill="x", pady=(3, 0))
-        self.desc_entry.bind("<FocusOut>",
-                             lambda e: self.app.save_state())
-        self.desc_entry.bind("<Return>",
-                             lambda e: self.app.save_state())
+        self.desc_entry.bind("<FocusOut>", lambda e: self._sync_desc())
+        self.desc_entry.bind("<Return>", lambda e: self._sync_desc())
 
         self.del_btn = tk.Button(self, text="\u274C",  # ❌
                                  width=3, font=app.app_font, relief="flat",
@@ -280,6 +277,48 @@ class ShortcutCard(tk.Frame):
         # widget 就绪后再入队异步提取（结果经主线程轮询回填）
         if pending_async:
             app.request_icon(self)
+
+    # ---- 数据转发（重构 P4：业务字段的唯一真源是 self.item） ----
+    @property
+    def path(self):
+        return self.item.path
+
+    @property
+    def custom_title(self):
+        return self.item.title
+
+    @custom_title.setter
+    def custom_title(self, v):
+        self.item.title = v or ""
+
+    @property
+    def custom_icon(self):
+        return self.item.icon
+
+    @custom_icon.setter
+    def custom_icon(self, v):
+        self.item.icon = v or ""
+
+    @property
+    def launch_count(self):
+        return self.item.launch_count
+
+    @launch_count.setter
+    def launch_count(self, v):
+        self.item.launch_count = max(0, int(v or 0))
+
+    @property
+    def last_launch_ts(self):
+        return self.item.last_launch_ts
+
+    @last_launch_ts.setter
+    def last_launch_ts(self, v):
+        self.item.last_launch_ts = max(0.0, float(v or 0.0))
+
+    def _sync_desc(self):
+        """描述输入框内容同步进数据模型并请求保存。"""
+        self.item.description = self.desc_var.get()
+        self.app.mark_dirty("desc")
 
     def set_extracted_icon(self, pil):
         """worker 线程提取完成后由主线程调用，回填真实图标。
@@ -399,7 +438,7 @@ class ShortcutCard(tk.Frame):
         if new is None:
             return  # 用户取消
         self.set_custom_title(new)
-        self.app.save_state()
+        self.app.mark_dirty()
 
     def _menu_change_icon(self):
         p = filedialog.askopenfilename(
@@ -410,7 +449,7 @@ class ShortcutCard(tk.Frame):
         if not p:
             return
         if self.set_custom_icon(p):
-            self.app.save_state()
+            self.app.mark_dirty()
 
     def _menu_refresh_icon(self):
         """删除该卡片的图标缓存条目并重新入队异步提取。
@@ -430,7 +469,7 @@ class ShortcutCard(tk.Frame):
         if new is None:
             return
         self.desc_var.set(new)
-        self.app.save_state()
+        self.app.mark_dirty()
 
     def _menu_open_location(self):
         """在资源管理器中打开文件所在位置并选中该文件。"""
@@ -539,16 +578,15 @@ class FolderFrame(tk.Frame):
     def _CARD_UNIT(self):
         return int(self.app.card_width) + 10
 
-    def __init__(self, master, app, folder_id, name):
+    def __init__(self, master, app, meta):
+        """meta: quickdeck.model.workspace.Folder——文件夹元数据
+        （id/name/locked/collapsed）的唯一真源（重构 P4）。"""
         th = app.theme
         super().__init__(master, bd=1, relief="solid", bg=th["folder_bg"])
         self.app = app
-        self.id = folder_id
-        self.name = name
+        self.meta = meta
         self.cards = []
         self._num_cols = 1
-        self.locked = False  # 上锁时禁用名字编辑 / 卡片编辑 / 卡片拖拽 / 删除
-        self.collapsed = False  # 折叠时隐藏卡片区（body），header 保留；与 locked 相互独立
 
         # ---- header（紧凑：小 padding，无冗余空间） ----
         header = tk.Frame(self, bg=th["header_bg"], padx=4, pady=1)
@@ -567,7 +605,7 @@ class FolderFrame(tk.Frame):
         )
         self.drag_handle.pack(side="left")
 
-        self.name_var = tk.StringVar(value=name)
+        self.name_var = tk.StringVar(value=meta.name)
         self.name_entry = tk.Entry(
             header, textvariable=self.name_var,
             font=self._header_font, bd=0, bg=th["header_bg"],
@@ -625,6 +663,35 @@ class FolderFrame(tk.Frame):
             w.bind("<B1-Motion>", self._on_folder_drag_motion)
             w.bind("<ButtonRelease-1>", self._on_folder_drag_end)
 
+    # ---- 数据转发（重构 P4：元数据唯一真源是 self.meta） ----
+    @property
+    def id(self):
+        return self.meta.id
+
+    @property
+    def name(self):
+        return self.meta.name
+
+    @name.setter
+    def name(self, v):
+        self.meta.name = v
+
+    @property
+    def locked(self):
+        return self.meta.locked
+
+    @locked.setter
+    def locked(self, v):
+        self.meta.locked = bool(v)
+
+    @property
+    def collapsed(self):
+        return self.meta.collapsed
+
+    @collapsed.setter
+    def collapsed(self, v):
+        self.meta.collapsed = bool(v)
+
     def refresh_header_font(self):
         """app 字体变化时，让 header 内部小号字跟着刷新。"""
         try:
@@ -672,7 +739,7 @@ class FolderFrame(tk.Frame):
             return
         if new_name != self.name:
             self.name = new_name
-            self.app.save_state()
+            self.app.mark_dirty()
 
     def _on_delete(self):
         if self.locked:
@@ -681,7 +748,7 @@ class FolderFrame(tk.Frame):
 
     def _on_toggle_lock(self):
         self.set_locked(not self.locked)
-        self.app.save_state()
+        self.app.mark_dirty()
 
     def set_locked(self, locked):
         """切换本 folder 的锁定态，并把状态传播到 header + 所有卡片。"""
@@ -715,7 +782,7 @@ class FolderFrame(tk.Frame):
 
     def _on_toggle_collapse(self):
         self.set_collapsed(not self.collapsed)
-        self.app.save_state()
+        self.app.mark_dirty()
 
     def set_collapsed(self, collapsed):
         """折叠/展开卡片区。header（含名字/锁/删除按钮）始终保留。"""
@@ -964,6 +1031,9 @@ class App(_TK_BASE):
         self.dragging_folder = None
         self._save_timer = None
         self._font_apply_timer = None
+        # 保存收口（重构 P4）：mark_dirty 置脏 + 400ms 防抖 flush
+        self._dirty = False
+        self._dirty_after = None
         # 视图模式："cards"（文件夹卡片视图）
         # / "usage"（按使用频率+最近启动的临时只读平铺视图）
         # / "web"（网页快捷方式独立存储区：.url 卡片不进文件夹，
@@ -1086,7 +1156,7 @@ class App(_TK_BASE):
             if self._add_card(p, "", folder=target):
                 added += 1
         if added:
-            self.save_state()
+            self.mark_dirty()
 
     # ============================================================
     # 便捷 accessors
@@ -1550,7 +1620,7 @@ class App(_TK_BASE):
         want = self._resolve_theme()
         if want is not self.theme:
             self.apply_theme(want)
-        self.save_state()  # 主题没变也要把模式选择持久化
+        self.mark_dirty()  # 主题没变也要把模式选择持久化
 
     def _poll_theme_change(self):
         """每 5 秒查一次注册表；仅"跟随系统"模式下响应系统深/浅色变化。"""
@@ -1997,8 +2067,10 @@ class App(_TK_BASE):
     # ============================================================
     # 文件夹管理
     # ============================================================
-    def _create_folder(self, folder_id, name):
-        f = FolderFrame(self.inner_frame, self, folder_id, name)
+    def _create_folder(self, folder_id, name, meta=None):
+        if meta is None:
+            meta = Folder(id=folder_id, name=name)
+        f = FolderFrame(self.inner_frame, self, meta)
         # 临时平铺视图下不显示 folder（切回卡片视图时 _refresh_view 统一 pack）
         if self.view_mode == "cards":
             f.pack(fill="x", padx=6, pady=(6, 0))
@@ -2034,7 +2106,7 @@ class App(_TK_BASE):
         fid = "f_" + uuid.uuid4().hex[:8]
         name = f"新文件夹 {len(self.folders) + 1}"
         self._create_folder(fid, name)
-        self.save_state()
+        self.mark_dirty()
 
     def _on_open_app_dir(self):
         """打开 QuickDeck 本体（exe / 脚本）所在目录。"""
@@ -2152,7 +2224,7 @@ class App(_TK_BASE):
             self._update_scrollregion()
         except Exception:
             pass
-        self.save_state()
+        self.mark_dirty()
 
     # ============================================================
     # 添加 / 删除卡片
@@ -2168,7 +2240,7 @@ class App(_TK_BASE):
             # 添加到最后一个文件夹的末尾（用户手动新增时的默认落点）
             target = self.folders[-1] if self.folders else None
             self._add_card(path, "", folder=target)
-            self.save_state()
+            self.mark_dirty()
 
     def _on_multi_add(self):
         paths = filedialog.askopenfilenames(
@@ -2181,7 +2253,7 @@ class App(_TK_BASE):
         for p in paths:
             self._add_card(p, "", folder=target)
         if paths:
-            self.save_state()
+            self.mark_dirty()
 
     def _on_add_dir(self):
         """选择一个目录加入文件夹快捷方式独立存储区。"""
@@ -2191,7 +2263,7 @@ class App(_TK_BASE):
         # askdirectory 返回正斜杠路径，统一成 Windows 风格
         path = os.path.normpath(path)
         if self._add_card(path, ""):
-            self.save_state()
+            self.mark_dirty()
 
     def _pick_multiple_dirs(self):
         """系统 IFileOpenDialog（FOS_PICKFOLDERS + FOS_ALLOWMULTISELECT）
@@ -2283,7 +2355,7 @@ class App(_TK_BASE):
             if self._add_card(p, ""):
                 added += 1
         if added:
-            self.save_state()
+            self.mark_dirty()
 
     @staticmethod
     def _normalize_path(p):
@@ -2322,12 +2394,12 @@ class App(_TK_BASE):
             if not self.folders:
                 self._create_folder(self.DEFAULT_FOLDER_ID, "默认")
             folder = self.folders[-1]
+        item = Shortcut(path=path, description=description or "",
+                        title=custom_title or "", icon=custom_icon or "",
+                        launch_count=max(0, int(launch_count or 0)),
+                        last_launch_ts=max(0.0, float(last_launch_ts or 0.0)))
         try:
-            card = ShortcutCard(self.inner_frame, self, path, description,
-                                custom_title=custom_title,
-                                custom_icon=custom_icon,
-                                launch_count=launch_count,
-                                last_launch_ts=last_launch_ts)
+            card = ShortcutCard(self.inner_frame, self, item)
         except Exception as e:
             print(f"[QuickDeck] add_card error: {e}", file=sys.stderr)
             return False
@@ -2340,12 +2412,12 @@ class App(_TK_BASE):
                              launch_count=0, last_launch_ts=0.0):
         """把卡片加入独立存储区（web_cards / dir_cards）末尾
         （调用方已做去重）。"""
+        item = Shortcut(path=path, description=description or "",
+                        title=custom_title or "", icon=custom_icon or "",
+                        launch_count=max(0, int(launch_count or 0)),
+                        last_launch_ts=max(0.0, float(last_launch_ts or 0.0)))
         try:
-            card = ShortcutCard(self.inner_frame, self, path, description,
-                                custom_title=custom_title,
-                                custom_icon=custom_icon,
-                                launch_count=launch_count,
-                                last_launch_ts=last_launch_ts)
+            card = ShortcutCard(self.inner_frame, self, item)
         except Exception as e:
             print(f"[QuickDeck] add_standalone_card error: {e}",
                   file=sys.stderr)
@@ -2365,7 +2437,7 @@ class App(_TK_BASE):
             return
         self._move_card_to(card, target_folder, len(target_folder.cards))
         self._refresh_view_if_flat()
-        self.save_state()
+        self.mark_dirty()
 
     def remove_card(self, card):
         # 独立存储区卡片（网页区 / 文件夹区）：从对应列表移除
@@ -2378,7 +2450,7 @@ class App(_TK_BASE):
                 except Exception:
                     pass
                 self._refresh_view_if_flat()
-                self.save_state()
+                self.mark_dirty()
                 return
         folder = card.folder
         # folder 上锁时，任何路径的删除都失效（含未来可能的键盘快捷键等）
@@ -2391,7 +2463,7 @@ class App(_TK_BASE):
         except Exception:
             pass
         self._refresh_view_if_flat()
-        self.save_state()
+        self.mark_dirty()
 
     def launch_card(self, card):
         path = card.path
@@ -2409,7 +2481,7 @@ class App(_TK_BASE):
         # 不立即重排——卡片在鼠标下瞬移体验很差，下次进入该视图时生效
         card.launch_count += 1
         card.last_launch_ts = time.time()
-        self.save_state()
+        self.mark_dirty()
 
     # ============================================================
     # 加载配置
@@ -2506,7 +2578,7 @@ class App(_TK_BASE):
                 f.refresh_header_font()
             except Exception:
                 pass
-        self.save_state()
+        self.mark_dirty()
 
     # ---- 卡片宽度 ----
     def _make_small_font(self):
@@ -2669,7 +2741,7 @@ class App(_TK_BASE):
         if self.dragging_card is card:
             self.dragging_card = None
             if self.view_mode in ("web", "dirs"):
-                self.save_state()
+                self.mark_dirty()
                 return
             # 拖拽过程中每次 motion 都做过局部 reflow，但如果最后落点是刚
             # 新建的空文件夹，body 尚未完成首次布局，卡片可能显示不出。
@@ -2684,7 +2756,7 @@ class App(_TK_BASE):
                 self.update()
             except Exception:
                 pass
-            self.save_state()
+            self.mark_dirty()
 
     def _folder_at_y(self, y_root):
         # 优先命中：鼠标落在某个 folder 的 y 范围内
@@ -2815,12 +2887,30 @@ class App(_TK_BASE):
     def folder_drag_end(self, folder, event):
         if self.dragging_folder is folder:
             self.dragging_folder = None
-            self.save_state()
+            self.mark_dirty()
 
     # ============================================================
     # 状态持久化
     # ============================================================
+    def mark_dirty(self, reason=""):
+        """请求保存（重构 P4：保存收口）。400ms 防抖合并连发的变更；
+        真正落盘走 save_state。关闭窗口等需要立即持久化的路径直接调
+        save_state。"""
+        self._dirty = True
+        if self._dirty_after is None:
+            self._dirty_after = self.after(400, self._flush_dirty)
+
+    def _flush_dirty(self):
+        self._dirty_after = None
+        if self._dirty:
+            self._dirty = False
+            self.save_state()
+
     def save_state(self):
+        """把窗口/字体等标量 + 数据模型序列化进 cfg 并写盘。
+        卡片/文件夹的业务字段由数据层 to_record 输出（重构 P4）；
+        顺序按 UI 列表下标写入。"""
+        self._dirty = False
         try:
             self.cfg["window"] = {
                 "width": self.winfo_width(),
@@ -2837,45 +2927,27 @@ class App(_TK_BASE):
         self.cfg["card_width"] = int(self.card_width)
         self.cfg["theme_mode"] = self.theme_mode
         self.cfg["folders"] = [
-            {"id": f.id, "name": f.name, "order": i,
-             "locked": bool(getattr(f, "locked", False)),
-             "collapsed": bool(getattr(f, "collapsed", False))}
-            for i, f in enumerate(self.folders)
+            f.meta.to_record(i) for i, f in enumerate(self.folders)
         ]
         shortcuts = []
         for f in self.folders:
             for j, c in enumerate(f.cards):
-                shortcuts.append({
-                    "path": c.path,
-                    "description": c.desc_var.get(),
-                    "folder": f.id,
-                    "order": j,
-                    "title": getattr(c, "custom_title", "") or "",
-                    "icon": getattr(c, "custom_icon", "") or "",
-                    "launch_count": int(getattr(c, "launch_count", 0)),
-                    "last_launch_ts": float(
-                        getattr(c, "last_launch_ts", 0.0)),
-                })
+                # 兜底同步：描述可能正在编辑中（未触发 FocusOut）
+                c.item.description = c.desc_var.get()
+                shortcuts.append(c.item.to_record(j, folder_id=f.id))
         self.cfg["shortcuts"] = shortcuts
         for cfg_key, cards in (("web_shortcuts", self.web_cards),
                                ("dir_shortcuts", self.dir_cards)):
+            for c in cards:
+                c.item.description = c.desc_var.get()
             self.cfg[cfg_key] = [
-                {
-                    "path": c.path,
-                    "description": c.desc_var.get(),
-                    "order": j,
-                    "title": getattr(c, "custom_title", "") or "",
-                    "icon": getattr(c, "custom_icon", "") or "",
-                    "launch_count": int(getattr(c, "launch_count", 0)),
-                    "last_launch_ts": float(
-                        getattr(c, "last_launch_ts", 0.0)),
-                }
-                for j, c in enumerate(cards)
+                c.item.to_record(j) for j, c in enumerate(cards)
             ]
         save_config(self.cfg)
 
     def _on_close(self):
         try:
+            # 关闭前立即落盘（不走防抖）
             self.save_state()
             self._icon_loader.stop(timeout=1.0)
         finally:
