@@ -64,6 +64,7 @@ from quickdeck.model.workspace import Shortcut, Folder
 # ---- 重构 P5：主题 token 与注册制主题管理器 ----
 from quickdeck.ui.tokens import LIGHT_THEME, DARK_THEME
 from quickdeck.ui.theme import ThemeManager
+from quickdeck.platform.win32_paint import PaintGuard
 
 
 # ================================================================
@@ -1006,13 +1007,9 @@ class App(_TK_BASE):
         # _reflow / _reflow_flat 的中间 update_idletasks（防半成品
         # 布局上屏造成的卡片重叠残影），末尾统一刷新一次
         self._view_switch_batch = False
-        # WM_SETREDRAW 冻结标志：_freeze_paint 置位，防嵌套冻结
-        # 提前解冻（WM_SETREDRAW 无引用计数，内层 TRUE 会立即解除
-        # 外层的冻结），见 _freeze_paint / _thaw_paint
-        self._paint_frozen = False
-        # 幕布标志：_show_paint_curtain 置位，防嵌套挂两层幕布
-        # （_on_view_mode_change 与其内部的 _refresh_view 各有入口）
-        self._curtain_active = False
+        # 防闪三层机制收口（重构 P5b）：冻结/幕布/类刷子/深色标题栏
+        # 全部由 PaintGuard 持有，嵌套调用自动退化 no-op
+        self.paint = PaintGuard(self)
 
         # 图标异步提取（重构 P2：IconLoader 服务）：
         # 队列只传 (task_id, path, size) 纯数据，卡片经 WeakValueDictionary
@@ -1446,78 +1443,12 @@ class App(_TK_BASE):
             pass
 
     def _apply_class_bg_brush(self):
-        """把 Tk 窗口类的背景刷设为主题底色（best-effort）。
-
-        Tk 在 Windows 上注册的窗口类 hbrBackground 为 NULL：收到
-        WM_ERASEBKGND 时 DefWindowProc 不做任何填充，真正的内容绘制
-        推迟到 Tk 的 idle 回调。Win11 会在窗口最小化时丢弃 DWM 合成
-        表面，恢复时表面为全黑，在几百个控件的 idle 重绘逐个完成前
-        直接露出黑色（"恢复最小化时黑边一闪"的根因）。
-
-        给窗口类挂上主题色实心刷后，系统级曝光（恢复、遮挡后露出）
-        的擦除阶段会先填主题色，黑闪变为同色填充=不可见；Tk 内部
-        重绘用 InvalidateRect(..., FALSE) 不触发擦除，平时行为不变。
-
-        SetClassLongPtr 按"窗口类"生效：Tk 所有子控件共用 TkChild
-        类、顶层 wrapper 用独立类，各设一次即覆盖全部窗口。
-        """
-        try:
-            th = self.theme["app_bg"]  # "#RRGGBB"
-            colorref = (int(th[1:3], 16)
-                        | int(th[3:5], 16) << 8
-                        | int(th[5:7], 16) << 16)  # COLORREF = 0x00BBGGRR
-            gdi32 = ctypes.windll.gdi32
-            user32 = ctypes.windll.user32
-            new_brush = gdi32.CreateSolidBrush(colorref)
-            if not new_brush:
-                return
-            # 64 位下必须用 SetClassLongPtrW 并声明指针宽度的签名，
-            # 否则句柄被截断；32 位 Python 无此符号，回退 SetClassLongW
-            set_cls = getattr(user32, "SetClassLongPtrW", None) \
-                or user32.SetClassLongW
-            set_cls.restype = ctypes.c_ssize_t
-            set_cls.argtypes = [ctypes.c_ssize_t, ctypes.c_int,
-                                ctypes.c_ssize_t]
-            GCLP_HBRBACKGROUND = -10
-            self.update_idletasks()
-            child = self.winfo_id()                 # TkChild 类
-            top = user32.GetParent(child)           # 顶层 wrapper 类
-            for hwnd in {child, top}:
-                if hwnd:
-                    set_cls(hwnd, GCLP_HBRBACKGROUND, new_brush)
-            # 释放上一次主题切换时创建的旧刷子（类已不再引用它）
-            old = getattr(self, "_bg_brush", None)
-            if old:
-                gdi32.DeleteObject(old)
-            self._bg_brush = new_brush
-        except Exception:
-            pass
+        """委托 PaintGuard：Tk 窗口类背景刷 = 主题底色（防恢复黑闪）。"""
+        self.paint.apply_class_brush(self.theme["app_bg"])
 
     def _apply_titlebar_dark(self):
-        """Windows 10 1809+ / 11：让标题栏跟随深色主题（best-effort）。
-
-        只在目标值与上次实际写入的值不同时才调用 DWM。浅色是系统默认，
-        从未进过深色就完全不碰该属性——Win11 上给窗口写过
-        DWMWA_USE_IMMERSIVE_DARK_MODE（即使值为 0）后，窗口会走深浅色
-        感知的合成路径，最小化恢复时未完成重绘的区域会先被合成为黑色
-        （浅色模式下"卡片间隙黑边一闪"的根因）。
-        """
-        want = 0 if self.theme is LIGHT_THEME else 1
-        if want == getattr(self, "_titlebar_dark_val", 0):
-            return
-        try:
-            self.update_idletasks()
-            hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
-            val = ctypes.c_int(want)
-            # 20 = DWMWA_USE_IMMERSIVE_DARK_MODE；旧版本 build 用 19
-            for attr in (20, 19):
-                r = ctypes.windll.dwmapi.DwmSetWindowAttribute(
-                    hwnd, attr, ctypes.byref(val), ctypes.sizeof(val))
-                if r == 0:
-                    self._titlebar_dark_val = want
-                    break
-        except Exception:
-            pass
+        """委托 PaintGuard：标题栏深色跟随主题（仅变化时写 DWM）。"""
+        self.paint.set_titlebar_dark(self.theme is not LIGHT_THEME)
 
     def apply_theme(self, theme):
         """运行时切换整套主题：App 级控件 + 所有 folder + 所有 card。
@@ -1528,17 +1459,8 @@ class App(_TK_BASE):
         把尚未完成重绘的客户区区域合成为黑色（切换瞬间的黑边）。复用
         _show_paint_curtain 盖住全程，重绘与 DWM 重建都在幕布下完成，
         撤幕即完整新主题帧。"""
-        curtain = self._show_paint_curtain()
-        try:
+        with self.paint.guard(freeze=False):
             self._apply_theme_body(theme)
-            if curtain:
-                # 幕布之下把全部控件的重绘做完再撤幕
-                try:
-                    self.update()
-                except Exception:
-                    pass
-        finally:
-            self._hide_paint_curtain(curtain)
 
     def _apply_theme_body(self, theme):
         """重构 P5：控件配色统一走 ThemeManager 注册表刷新，
@@ -1585,26 +1507,12 @@ class App(_TK_BASE):
         if mode == self.view_mode:
             return
         self.view_mode = mode
-        # 三层防残影（见 _show_paint_curtain / _freeze_paint）：
-        # 幕布原位盖住旧帧 → 冻结中完成几何重建（含工具栏 repack）→
-        # 幕布之下把切换排队的事件与逐 widget 重绘全部做完 → 撤幕
-        curtain = self._show_paint_curtain()
-        try:
-            frozen = self._freeze_paint()
-            try:
-                self._update_toolbar_buttons()
-                self._refresh_view()
-            finally:
-                self._thaw_paint(frozen)
-            if curtain:
-                # update() 处理完 <Configure> 触发的二次 reflow 与全部
-                # Expose 绘制后返回，撤幕露出的即完整新帧
-                try:
-                    self.update()
-                except Exception:
-                    pass
-        finally:
-            self._hide_paint_curtain(curtain)
+        # 三层防残影收口为 paint.guard（重构 P5b）：幕布原位盖住旧帧 →
+        # 冻结中完成几何重建（含工具栏 repack）→ 幕布之下把排队事件与
+        # 逐 widget 重绘全部做完 → 撤幕即完整新帧
+        with self.paint.guard():
+            self._update_toolbar_buttons()
+            self._refresh_view()
 
     def _update_toolbar_buttons(self):
         """工具栏按钮按当前视图显隐：
@@ -1651,170 +1559,19 @@ class App(_TK_BASE):
             return list(self.dir_cards)
         return []
 
-    # WM_SETREDRAW / RedrawWindow 常量
-    _WM_SETREDRAW = 0x000B
-    _RDW_REPAINT = 0x0001 | 0x0004 | 0x0080 | 0x0100  # INVALIDATE|ERASE|ALLCHILDREN|UPDATENOW
-
-    def _freeze_paint(self):
-        """WM_SETREDRAW(FALSE)：冻结客户区 HWND 及其全部子 HWND 的屏幕
-        更新，屏幕定格当前画面。
-
-        视图切换重叠残影的真正根因在 Win32 层：Tk 在 Windows 上每个
-        widget 都是独立 HWND，一次 update_idletasks 内部对每张卡片逐个
-        SetWindowPos，其屏幕效果是立即的——系统把该窗口现有像素 bitblt
-        到新位置，腾出的旧区域只标记 invalidate，擦除要等回到 mainloop
-        处理 WM_PAINT 之后。窗口期内"新位置卡片 + 旧位置陈旧像素"同屏，
-        即同一张卡片出现两次的重叠画面。因此无论把 Tcl 层 flush 压缩到
-        几次都无效（_view_switch_batch 只解决了多帧半成品布局问题）。
-        冻结期间 SetWindowPos 只改几何不上屏，几何计算（winfo_* /
-        update_idletasks）完全不受影响。
-
-        返回冻结的 hwnd（交给 _thaw_paint），已冻结（嵌套调用）或
-        失败时返回 None——WM_SETREDRAW 无引用计数，嵌套必须由外层
-        统一解冻。"""
-        if self._paint_frozen:
-            return None
-        try:
-            hwnd = self.winfo_id()  # 客户区 HWND（wrapper 的子窗口）
-            ctypes.windll.user32.SendMessageW(
-                hwnd, self._WM_SETREDRAW, 0, 0)
-        except Exception:
-            return None
-        self._paint_frozen = True
-        return hwnd
-
-    def _thaw_paint(self, hwnd):
-        """WM_SETREDRAW(TRUE) + RedrawWindow(RDW_ALLCHILDREN)：解冻并
-        令整棵子树一次性重绘——屏幕从完整旧帧直接切到完整新帧。
-        hwnd 为 None（嵌套冻结的内层 / 冻结失败）时不做任何事。"""
-        if not hwnd:
-            return
-        self._paint_frozen = False
-        try:
-            user32 = ctypes.windll.user32
-            user32.SendMessageW(hwnd, self._WM_SETREDRAW, 1, 0)
-            user32.RedrawWindow(hwnd, None, None, self._RDW_REPAINT)
-        except Exception:
-            pass
-
-    # 幕布窗口常量
-    _CURTAIN_STYLE = 0x80000000 | 0x10000000 | 0x0000000E  # WS_POPUP|WS_VISIBLE|SS_BITMAP
-    _CURTAIN_EXSTYLE = 0x08000000 | 0x00000080  # WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW
-    _STM_SETIMAGE = 0x0172
-    _SRCCOPY = 0x00CC0020
-
-    def _show_paint_curtain(self):
-        """截取客户区当前像素，用原生 Win32 STATIC 位图弹窗原位盖住。
-
-        防残影第三层（根治）。WM_SETREDRAW 冻结只解决了布局期间
-        SetWindowPos 的即时 bitblt 上屏；但解冻时 RedrawWindow(UPDATENOW)
-        发出的 WM_PAINT 在 Tk 里并不同步绘制——Tk 的窗口过程只是
-        BeginPaint/EndPaint 把区域 validate 掉、转成 Expose 事件排队，
-        真正的像素绘制要回到 mainloop 后逐 widget 在 idle 阶段完成。
-        因此解冻瞬间屏幕仍是定格的旧帧，新帧是随后逐块画上去的，
-        旧像素与新位置卡片混杂的窗口期依旧存在 → 残影未消。
-
-        幕布方案与绘制时序彻底解耦：切换前把客户区现有像素 BitBlt 进
-        内存位图，创建一个原生 STATIC(SS_BITMAP) 弹窗原位盖住客户区
-        （owner 为顶层 wrapper，天然压在本窗口之上；WS_EX_NOACTIVATE
-        不抢焦点；STATIC 在 WM_PAINT 里同步绘制，UpdateWindow 立即
-        上屏，与旧帧逐像素相同 → 盖上的瞬间无任何视觉变化）。DWM 下
-        被遮挡的窗口照常把新帧画进自己的合成表面，等切换与全部重绘
-        在幕布下做完再撤幕，露出的直接就是完整新帧。
-
-        返回 (幕布 hwnd, HBITMAP) 交给 _hide_paint_curtain；已有幕布
-        （嵌套）、窗口未映射或任何 Win32 调用失败时返回 None（调用方
-        退化为仅冻结方案）。"""
-        if self._curtain_active:
-            return None
-        # 本方法可能先于任何图标提取被调用（首次视图切换），argtypes
-        # 未声明时 CreateWindowExW 的 style（高位置位）会溢出 c_int
-        _init_win_apis()
-        user32 = ctypes.windll.user32
-        gdi32 = ctypes.windll.gdi32
-        hbm = None
-        try:
-            if not self.winfo_ismapped():
-                return None
-            hwnd = self.winfo_id()
-            w, h = int(self.winfo_width()), int(self.winfo_height())
-            x, y = int(self.winfo_rootx()), int(self.winfo_rooty())
-            if w <= 1 or h <= 1:
-                return None
-            # 1) 客户区当前像素 → 内存位图（DWM 重定向表面不受遮挡影响）
-            hdc = user32.GetDC(hwnd)
-            if not hdc:
-                return None
-            ok = 0
-            try:
-                mdc = gdi32.CreateCompatibleDC(hdc)
-                if not mdc:
-                    return None
-                try:
-                    hbm = gdi32.CreateCompatibleBitmap(hdc, w, h)
-                    if hbm:
-                        old = gdi32.SelectObject(mdc, hbm)
-                        ok = gdi32.BitBlt(mdc, 0, 0, w, h,
-                                          hdc, 0, 0, self._SRCCOPY)
-                        gdi32.SelectObject(mdc, old)
-                finally:
-                    gdi32.DeleteDC(mdc)
-            finally:
-                user32.ReleaseDC(hwnd, hdc)
-            if not (hbm and ok):
-                raise OSError("curtain capture failed")
-            # 2) 原生位图弹窗原位盖住客户区并立即同步上屏
-            owner = user32.GetParent(hwnd) or hwnd
-            hinst = ctypes.windll.kernel32.GetModuleHandleW(None)
-            cw = user32.CreateWindowExW(
-                self._CURTAIN_EXSTYLE, "STATIC", None, self._CURTAIN_STYLE,
-                x, y, w, h, owner, None, hinst, None)
-            if not cw:
-                raise OSError("curtain window failed")
-            user32.SendMessageW(cw, self._STM_SETIMAGE, 0, hbm)
-            user32.UpdateWindow(cw)
-            self._curtain_active = True
-            return (cw, hbm)
-        except Exception as e:
-            print(f"[QuickDeck] paint curtain fallback: {e!r}",
-                  file=sys.stderr)
-            if hbm:
-                try:
-                    gdi32.DeleteObject(hbm)
-                except Exception:
-                    pass
-            return None
-
-    def _hide_paint_curtain(self, curtain):
-        """撤幕并释放截屏位图。curtain 为 None（嵌套/失败）时不做任何事。"""
-        if not curtain:
-            return
-        self._curtain_active = False
-        cw, hbm = curtain
-        try:
-            ctypes.windll.user32.DestroyWindow(cw)
-        except Exception:
-            pass
-        try:
-            ctypes.windll.gdi32.DeleteObject(hbm)
-        except Exception:
-            pass
-
     def _refresh_view(self):
         """按 self.view_mode 重建列表区显示。
 
-        三层防残影：
-        1. _show_paint_curtain（根治）——截屏幕布盖住旧帧，重建与全部
-           重绘在幕布下完成，撤幕即完整新帧，与 Tk 异步绘制时序解耦。
-        2. _freeze_paint（Win32 层兜底）——冻结屏幕更新，重建期间
+        三层防残影（实现见 quickdeck.platform.win32_paint.PaintGuard）：
+        1. 截屏幕布（根治）——盖住旧帧，重建与全部重绘在幕布下完成，
+           撤幕即完整新帧，与 Tk 异步绘制时序解耦。
+        2. WM_SETREDRAW 冻结（Win32 层兜底）——冻结屏幕更新，重建期间
            SetWindowPos 不上屏；幕布失败时仍消除布局中途的即时 bitblt。
         3. _view_switch_batch（Tcl 层兜底）——抑制 _reflow / _reflow_flat
            内部的 update_idletasks，整个切换只在末尾 flush 一次几何。
         经 _on_view_mode_change 进入时幕布/冻结已由外层挂好，此处的
-        同名调用因嵌套标志直接跳过。"""
-        curtain = self._show_paint_curtain()
-        frozen = self._freeze_paint()
-        try:
+        guard 因嵌套标志自动退化为 no-op。"""
+        with self.paint.guard():
             self._view_switch_batch = True
             try:
                 if self.view_mode == "cards":
@@ -1862,15 +1619,6 @@ class App(_TK_BASE):
                 self.update_idletasks()
             except Exception:
                 pass
-        finally:
-            self._thaw_paint(frozen)
-            if curtain:
-                # 幕布之下把 Expose 逐 widget 绘制与排队事件全部做完
-                try:
-                    self.update()
-                except Exception:
-                    pass
-            self._hide_paint_curtain(curtain)
 
     def _reflow_flat(self, cards):
         """把 cards 按 App.card_width 平铺 grid 进 flat_view。
