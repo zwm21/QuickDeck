@@ -61,6 +61,9 @@ from quickdeck.config.schema import DEFAULT_CONFIG, default_config
 from quickdeck.config.store import ConfigStore
 # ---- 重构 P4：数据层（widget 只作渲染，业务数据在纯数据类） ----
 from quickdeck.model.workspace import Shortcut, Folder
+# ---- 重构 P5：主题 token 与注册制主题管理器 ----
+from quickdeck.ui.tokens import LIGHT_THEME, DARK_THEME
+from quickdeck.ui.theme import ThemeManager
 
 
 # ================================================================
@@ -101,41 +104,9 @@ LOCAL_FONT_FILE = _resource_path("HYWenHei-65W.ttf")
 
 
 # ================================================================
-# 主题（浅色 / 深色）
+# 主题（重构 P5：token 表在 quickdeck.ui.tokens，注册制见 ThemeManager）
 # ================================================================
-LIGHT_THEME = {
-    "name": "light",
-    "app_bg": "#F0F0F0",           # 主窗口 / 滚动区背景
-    "panel_bg": "#F8F9FA",         # 底部字体设置卡片
-    "card_bg": "#FFFFFF",          # 快捷方式卡片
-    "desc_bg": "#F4F4F4",          # 描述输入框
-    "folder_bg": "#F5F5F5",        # 文件夹框体 / body
-    "header_bg": "#E0E0E0",        # 文件夹 header
-    "fg": "#000000",               # 常规文字
-    "header_fg": "#333333",        # header 上的图标按钮
-    "danger_fg": "#B22222",        # 删除类按钮文字
-    "danger_active_bg": "#FADBD8",
-    "header_active_bg": "#D0D0D0",
-    "btn_bg": "#F0F0F0",           # 工具栏按钮
-    "btn_active_bg": "#E2E2E2",
-}
-
-DARK_THEME = {
-    "name": "dark",
-    "app_bg": "#1F1F1F",
-    "panel_bg": "#2A2A2A",
-    "card_bg": "#2D2D30",
-    "desc_bg": "#3C3C3C",
-    "folder_bg": "#262626",
-    "header_bg": "#333333",
-    "fg": "#E6E6E6",
-    "header_fg": "#CCCCCC",
-    "danger_fg": "#E57373",
-    "danger_active_bg": "#5C2B2B",
-    "header_active_bg": "#454545",
-    "btn_bg": "#3A3A3A",
-    "btn_active_bg": "#4A4A4A",
-}
+# LIGHT_THEME / DARK_THEME 经由顶部 import 提供
 
 
 
@@ -273,6 +244,17 @@ class ShortcutCard(tk.Frame):
             w.bind("<ButtonRelease-1>", self._on_drag_end)
             w.bind("<Double-Button-1>", self._on_double_click)
             w.bind("<Button-3>", self._on_right_click)
+
+        # 主题注册（重构 P5：切主题时由 ThemeManager 统一刷新）
+        tm = app.tm
+        tm.register(self, bg="card_bg")
+        tm.register(self.icon_label, bg="card_bg")
+        tm.register(mid, bg="card_bg")
+        tm.register(self.title_label, bg="card_bg", fg="fg")
+        tm.register(self.desc_entry, bg="desc_bg", fg="fg",
+                    insertbackground="fg", readonlybackground="desc_bg")
+        tm.register(self.del_btn, bg="card_bg", fg="danger_fg",
+                    activebackground="danger_active_bg")
 
         # widget 就绪后再入队异步提取（结果经主线程轮询回填）
         if pending_async:
@@ -543,25 +525,6 @@ class ShortcutCard(tk.Frame):
             except Exception:
                 pass
 
-    # ---- 主题 ----
-    def apply_theme(self):
-        """按 app.theme 重刷本卡片配色（运行时深/浅色切换用）。"""
-        th = self.app.theme
-        try:
-            self.configure(bg=th["card_bg"])
-            self.icon_label.configure(bg=th["card_bg"])
-            self.mid.configure(bg=th["card_bg"])
-            self.title_label.configure(bg=th["card_bg"], fg=th["fg"])
-            self.desc_entry.configure(
-                bg=th["desc_bg"], fg=th["fg"],
-                insertbackground=th["fg"],
-                readonlybackground=th["desc_bg"])
-            self.del_btn.configure(
-                bg=th["card_bg"], fg=th["danger_fg"],
-                activebackground=th["danger_active_bg"])
-        except tk.TclError:
-            pass
-
 
 # ================================================================
 # 文件夹
@@ -663,6 +626,21 @@ class FolderFrame(tk.Frame):
             w.bind("<B1-Motion>", self._on_folder_drag_motion)
             w.bind("<ButtonRelease-1>", self._on_folder_drag_end)
 
+        # 主题注册（重构 P5）
+        tm = app.tm
+        tm.register(self, bg="folder_bg")
+        tm.register(header, bg="header_bg")
+        tm.register(self.drag_handle, bg="header_bg", fg="fg")
+        tm.register(self.name_entry, bg="header_bg", fg="fg",
+                    insertbackground="fg", readonlybackground="header_bg")
+        tm.register(self.lock_btn, bg="header_bg", fg="header_fg",
+                    activebackground="header_active_bg")
+        tm.register(self.collapse_btn, bg="header_bg", fg="header_fg",
+                    activebackground="header_active_bg")
+        tm.register(self.del_btn, bg="header_bg", fg="danger_fg",
+                    activebackground="danger_active_bg")
+        tm.register(self.body, bg="folder_bg")
+
     # ---- 数据转发（重构 P4：元数据唯一真源是 self.meta） ----
     @property
     def id(self):
@@ -700,30 +678,6 @@ class FolderFrame(tk.Frame):
                 size=max(8, int(self.app.app_font.cget("size")) - 1)
             )
         except Exception:
-            pass
-
-    def apply_theme(self):
-        """按 app.theme 重刷本文件夹配色（运行时深/浅色切换用）。"""
-        th = self.app.theme
-        try:
-            self.configure(bg=th["folder_bg"])
-            self.header.configure(bg=th["header_bg"])
-            self.drag_handle.configure(bg=th["header_bg"], fg=th["fg"])
-            self.name_entry.configure(
-                bg=th["header_bg"], fg=th["fg"],
-                insertbackground=th["fg"],
-                readonlybackground=th["header_bg"])
-            self.lock_btn.configure(
-                bg=th["header_bg"], fg=th["header_fg"],
-                activebackground=th["header_active_bg"])
-            self.collapse_btn.configure(
-                bg=th["header_bg"], fg=th["header_fg"],
-                activebackground=th["header_active_bg"])
-            self.del_btn.configure(
-                bg=th["header_bg"], fg=th["danger_fg"],
-                activebackground=th["danger_active_bg"])
-            self.body.configure(bg=th["folder_bg"])
-        except tk.TclError:
             pass
 
     # ---- 事件 ----
@@ -981,6 +935,8 @@ class App(_TK_BASE):
         # 主题模式：system（跟随系统，轮询注册表）/ light / dark（固定）
         self.theme_mode = self.cfg.get("theme_mode", "system")
         self.theme = self._resolve_theme()
+        # 主题注册制（重构 P5）：控件创建后登记映射，切换时统一刷新
+        self.tm = ThemeManager(self.theme)
 
         # _sanitize_config 已经把 window.* 保证为 int 且在合理范围；
         # 但配置里记的 x/y 可能对应已拔掉的显示器坐标（多屏用户）。
@@ -1423,6 +1379,30 @@ class App(_TK_BASE):
             self.flat_view, text=self._FLAT_EMPTY_TEXT["web"],
             font=self.app_font, bg=th["folder_bg"], fg=th["fg"])
 
+        # ---- 主题注册（重构 P5：App 级控件） ----
+        tm = self.tm
+        tm.register(self, bg="app_bg")
+        tm.register(self.bottom_frame, bg="app_bg")
+        tm.register(self.toolbar, bg="app_bg")
+        tm.register(self.list_wrap, bg="app_bg")
+        tm.register(self.canvas, bg="app_bg")
+        tm.register(self.inner_frame, bg="app_bg")
+        tm.register(self.flat_view, bg="folder_bg")
+        tm.register(self._flat_empty_label, bg="folder_bg", fg="fg")
+        tm.register(self.font_card, bg="panel_bg")
+        for lbl in self._panel_labels:
+            tm.register(lbl, bg="panel_bg", fg="fg")
+        for spin in (self.font_size_spin, self.card_width_spin):
+            tm.register(spin, bg="desc_bg", fg="fg",
+                        insertbackground="fg", buttonbackground="btn_bg")
+        for btn in (self.add_btn, self.multi_add_btn,
+                    self.new_folder_btn, self.add_dir_btn,
+                    self.multi_add_dir_btn, self.open_dir_btn,
+                    self.card_width_arrow_up, self.card_width_arrow_dn):
+            tm.register(btn, bg="btn_bg", fg="fg",
+                        activebackground="btn_active_bg",
+                        activeforeground="fg")
+
     def _apply_style_font(self):
         fam = self.app_font.cget("family")
         sz = int(self.app_font.cget("size"))
@@ -1561,47 +1541,13 @@ class App(_TK_BASE):
             self._hide_paint_curtain(curtain)
 
     def _apply_theme_body(self, theme):
+        """重构 P5：控件配色统一走 ThemeManager 注册表刷新，
+        不再逐控件硬编码枚举（旧版三处枚举极易漏刷新增控件）。"""
         self.theme = theme
-        th = theme
-        try:
-            self.configure(bg=th["app_bg"])
-            self.bottom_frame.configure(bg=th["app_bg"])
-            self.toolbar.configure(bg=th["app_bg"])
-            self.list_wrap.configure(bg=th["app_bg"])
-            self.canvas.configure(bg=th["app_bg"])
-            self.inner_frame.configure(bg=th["app_bg"])
-            self.flat_view.configure(bg=th["folder_bg"])
-            self._flat_empty_label.configure(bg=th["folder_bg"],
-                                             fg=th["fg"])
-            self.font_card.configure(bg=th["panel_bg"])
-            for lbl in self._panel_labels:
-                lbl.configure(bg=th["panel_bg"], fg=th["fg"])
-            for spin in (self.font_size_spin, self.card_width_spin):
-                spin.configure(bg=th["desc_bg"], fg=th["fg"],
-                               insertbackground=th["fg"],
-                               buttonbackground=th["btn_bg"])
-            for btn in (self.add_btn, self.multi_add_btn,
-                        self.new_folder_btn, self.add_dir_btn,
-                        self.multi_add_dir_btn, self.open_dir_btn,
-                        self.card_width_arrow_up, self.card_width_arrow_dn):
-                btn.configure(bg=th["btn_bg"], fg=th["fg"],
-                              activebackground=th["btn_active_bg"],
-                              activeforeground=th["fg"])
-        except tk.TclError:
-            pass
+        self.tm.apply(theme)
         self._apply_style_theme()
         self._apply_titlebar_dark()
         self._apply_class_bg_brush()
-        for f in self.folders:
-            try:
-                f.apply_theme()
-            except Exception:
-                pass
-        for c in self.every_card:
-            try:
-                c.apply_theme()
-            except Exception:
-                pass
 
     def _resolve_theme(self):
         """按当前 theme_mode 解析出应使用的主题 dict。"""
