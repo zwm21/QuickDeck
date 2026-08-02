@@ -64,6 +64,8 @@ from quickdeck.model.workspace import Shortcut, Folder
 # ---- 重构 P5：主题 token 与注册制主题管理器 ----
 from quickdeck.ui.tokens import LIGHT_THEME, DARK_THEME
 from quickdeck.ui.theme import ThemeManager
+# ---- 重构 P6：布局纯函数 ----
+from quickdeck.ui.layout import compute_cols
 from quickdeck.platform.win32_paint import PaintGuard
 
 
@@ -860,6 +862,8 @@ class App(_TK_BASE):
                             pass
                     for f in self.folders:
                         f.pack(fill="x", padx=6, pady=(6, 0))
+                        # 卡片刚被整体 grid_forget，必须绕过增量短路全量重排
+                        f.invalidate_grid()
                         try:
                             f._reflow()
                         except Exception:
@@ -927,8 +931,11 @@ class App(_TK_BASE):
         if w <= 1:
             w = max(1, self.winfo_width() - 40)
         cw = int(self.card_width)
-        ncols = max(1, int(w) // (cw + 10))
+        ncols = compute_cols(w, cw)
         self._flat_ncols = ncols
+        # 平铺视图把文件夹区卡片 grid_forget 了，回卡片视图时需全量重排
+        for f in self.folders:
+            f.invalidate_grid()
         for col in range(ncols):
             self.flat_view.grid_columnconfigure(col, minsize=cw, weight=0)
         for col in range(ncols, ncols + 8):
@@ -957,7 +964,7 @@ class App(_TK_BASE):
         """窗口宽度变化时按新宽度重算平铺列数。"""
         if self.view_mode == "cards":
             return
-        ncols = max(1, event.width // (int(self.card_width) + 10))
+        ncols = compute_cols(event.width, self.card_width)
         if ncols != self._flat_ncols:
             self._reflow_flat(self._flat_cards)
 
@@ -1012,8 +1019,9 @@ class App(_TK_BASE):
         self._update_scrollregion()
 
     def _on_mousewheel(self, event):
-        if not self.folders:
-            return
+        # 重构 P6 修复：旧实现 `if not self.folders: return` 会让
+        # web/dirs 视图在没有任何文件夹时滚轮完全失效——可滚性只与
+        # 当前 canvas 内容有关，交给下方 yview 判断
         rx, ry = event.x_root, event.y_root
         cx1 = self.canvas.winfo_rootx()
         cy1 = self.canvas.winfo_rooty()

@@ -7,6 +7,8 @@
 import tkinter as tk
 from tkinter import font as tkFont
 
+from quickdeck.ui.layout import compute_cols, grid_signature
+
 
 class FolderFrame(tk.Frame):
     """一个文件夹 section：header（拖拽把手 + 名字 + 删除）+ 卡片 grid 容器。
@@ -29,6 +31,7 @@ class FolderFrame(tk.Frame):
         self.meta = meta
         self.cards = []
         self._num_cols = 1
+        self._last_grid_sig = None  # 增量重排签名（重构 P6）
 
         # ---- header（紧凑：小 padding，无冗余空间） ----
         header = tk.Frame(self, bg=th["header_bg"], padx=4, pady=1)
@@ -267,7 +270,12 @@ class FolderFrame(tk.Frame):
             self._reflow()
 
     def _compute_num_cols(self, body_width):
-        return max(1, int(body_width) // self._CARD_UNIT)
+        return compute_cols(body_width, self.app.card_width)
+
+    def invalidate_grid(self):
+        """外部（视图切换等）把卡片 grid_forget 后调用，
+        强制下次 _reflow 全量重排（跳过增量短路）。"""
+        self._last_grid_sig = None
 
     # ---- 卡片管理 ----
     def add_card(self, card):
@@ -335,6 +343,15 @@ class FolderFrame(tk.Frame):
         if actual_w > 1:
             self._num_cols = self._compute_num_cols(actual_w)
 
+        # 增量短路（重构 P6）：列数/卡宽/卡片序列全部未变时跳过重排。
+        # 拖拽 motion、长按调宽循环等高频路径大多命中此分支，
+        # 避免旧实现每次全量 grid_forget + 重排的开销与闪烁。
+        cw = int(self.app.card_width)
+        sig = grid_signature(self.cards, self._num_cols, cw)
+        if sig == getattr(self, "_last_grid_sig", None):
+            return
+        self._last_grid_sig = sig
+
         # 无论 card 之前用的是 pack 还是 grid（且是否在别的 folder），
         # 都清一遍，避免 tk 拒绝在两个几何管理器之间切换的边角情况
         for c in self.cards:
@@ -346,7 +363,6 @@ class FolderFrame(tk.Frame):
                 c.pack_forget()
             except Exception:
                 pass
-        cw = int(self.app.card_width)
         for col in range(self._num_cols):
             self.body.grid_columnconfigure(col, minsize=cw, weight=0)
         # 收敛：清掉多余列的最小宽度配置
