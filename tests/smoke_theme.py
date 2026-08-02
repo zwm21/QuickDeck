@@ -38,8 +38,11 @@ def assert_theme(th, tag):
     check(f"{tag}: folder bg", f.cget("bg") == th["folder_bg"])
     check(f"{tag}: header bg", f.header.cget("bg") == th["header_bg"])
     check(f"{tag}: 工具栏按钮 bg", app.add_btn.cget("bg") == th["btn_bg"])
+    # P8 起删除按钮常态用次级色，hover 才显危险色
     check(f"{tag}: 删除按钮 fg",
-          card.del_btn.cget("fg") == th["danger_fg"])
+          card.del_btn.cget("fg") == th["fg_secondary"])
+    check(f"{tag}: 卡片描边 border",
+          card.cget("highlightbackground") == th["border"])
 
 
 app.theme_mode = "dark"

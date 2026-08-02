@@ -26,7 +26,10 @@ class FolderFrame(tk.Frame):
         """meta: quickdeck.model.workspace.Folder——文件夹元数据
         （id/name/locked/collapsed）的唯一真源（重构 P4）。"""
         th = app.theme
-        super().__init__(master, bd=1, relief="solid", bg=th["folder_bg"])
+        super().__init__(master, bd=0, bg=th["folder_bg"],
+                 highlightthickness=1,
+                 highlightbackground=th["border"],
+                 highlightcolor=th["border"])
         self.app = app
         self.meta = meta
         self.cards = []
@@ -43,6 +46,12 @@ class FolderFrame(tk.Frame):
             family=app.app_font.cget("family"),
             size=max(8, int(app.app_font.cget("size")) - 1)
         )
+        # P8 字号层级：文件夹名加粗（保持紧凑字号）
+        self._name_font = tkFont.Font(
+            family=app.app_font.cget("family"),
+            size=max(8, int(app.app_font.cget("size"))),
+            weight="bold"
+        )
 
         self.drag_handle = tk.Label(
             header, text="\u2630", font=self._header_font,  # ☰
@@ -53,7 +62,7 @@ class FolderFrame(tk.Frame):
         self.name_var = tk.StringVar(value=meta.name)
         self.name_entry = tk.Entry(
             header, textvariable=self.name_var,
-            font=self._header_font, bd=0, bg=th["header_bg"],
+            font=self._name_font, bd=0, bg=th["header_bg"],
             fg=th["fg"], insertbackground=th["fg"],
             readonlybackground=th["header_bg"],
             highlightthickness=0
@@ -68,7 +77,7 @@ class FolderFrame(tk.Frame):
             font=self._header_font, relief="flat", bd=0,
             bg=th["header_bg"], fg=th["header_fg"],
             activebackground=th["header_active_bg"],
-            padx=4, pady=0,
+            padx=4, pady=0, cursor="hand2",
             command=self._on_toggle_lock
         )
         self.lock_btn.pack(side="right", padx=(0, 2))
@@ -80,7 +89,7 @@ class FolderFrame(tk.Frame):
             font=self._header_font, relief="flat", bd=0,
             bg=th["header_bg"], fg=th["header_fg"],
             activebackground=th["header_active_bg"],
-            padx=4, pady=0,
+            padx=4, pady=0, cursor="hand2",
             command=self._on_toggle_collapse
         )
         self.collapse_btn.pack(side="right", padx=(0, 2))
@@ -90,9 +99,9 @@ class FolderFrame(tk.Frame):
         self.del_btn = tk.Button(
             header, text="\u2716",  # ✖
             font=self._header_font, relief="flat", bd=0,
-            bg=th["header_bg"], fg=th["danger_fg"],
+            bg=th["header_bg"], fg=th["header_fg"],
             activebackground=th["danger_active_bg"],
-            padx=4, pady=0,
+            padx=4, pady=0, cursor="hand2",
             command=self._on_delete
         )
         self.del_btn.pack(side="right")
@@ -110,7 +119,8 @@ class FolderFrame(tk.Frame):
 
         # 主题注册（重构 P5）
         tm = app.tm
-        tm.register(self, bg="folder_bg")
+        tm.register(self, bg="folder_bg", highlightbackground="border",
+                    highlightcolor="border")
         tm.register(header, bg="header_bg")
         tm.register(self.drag_handle, bg="header_bg", fg="fg")
         tm.register(self.name_entry, bg="header_bg", fg="fg",
@@ -119,9 +129,16 @@ class FolderFrame(tk.Frame):
                     activebackground="header_active_bg")
         tm.register(self.collapse_btn, bg="header_bg", fg="header_fg",
                     activebackground="header_active_bg")
-        tm.register(self.del_btn, bg="header_bg", fg="danger_fg",
+        tm.register(self.del_btn, bg="header_bg", fg="header_fg",
                     activebackground="danger_active_bg")
         tm.register(self.body, bg="folder_bg")
+
+        # P8 hover：header 图标按钮
+        from quickdeck.ui.widgets.hover import bind_hover
+        bind_hover(app, self.lock_btn, "header_bg", "header_active_bg")
+        bind_hover(app, self.collapse_btn, "header_bg", "header_active_bg")
+        bind_hover(app, self.del_btn, "header_bg", "danger_hover_bg",
+                   also_fg=("header_fg", "danger_fg"))
 
     # ---- 数据转发（重构 P4：元数据唯一真源是 self.meta） ----
     @property
@@ -155,6 +172,9 @@ class FolderFrame(tk.Frame):
     def refresh_header_font(self):
         """app 字体变化时，让 header 内部小号字跟着刷新。"""
         try:
+            self._name_font.configure(
+                family=self.app.app_font.cget("family"),
+                size=max(8, int(self.app.app_font.cget("size"))))
             self._header_font.configure(
                 family=self.app.app_font.cget("family"),
                 size=max(8, int(self.app.app_font.cget("size")) - 1)

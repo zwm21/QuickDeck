@@ -32,11 +32,16 @@ class ShortcutCard(tk.Frame):
         """item: quickdeck.model.workspace.Shortcut——卡片的业务数据
         全部存于纯数据对象（重构 P4），widget 属性仅作 property 转发。"""
         th = app.theme
-        super().__init__(master, bd=1, relief="solid",
-                         padx=8, pady=6, bg=th["card_bg"])
+        # P8 视觉：描边用 highlight 系（可主题化），替代 relief="solid"
+        super().__init__(master, bd=0, padx=8, pady=6, bg=th["card_bg"],
+                         highlightthickness=1,
+                         highlightbackground=th["border"],
+                         highlightcolor=th["border"])
         self.app = app
         self.item = item
         self.folder = None  # 由 FolderFrame.add_card / insert_card 设置
+        self._hovered = False
+        self._flash_job = None
         path = item.path
         description = item.description
 
@@ -66,27 +71,37 @@ class ShortcutCard(tk.Frame):
         self.mid = mid
 
         title_text = self.custom_title or get_title_for_file(path)
+        # P8 字号层级：标题加粗放大一号
         self.title_label = tk.Label(mid, text=title_text, anchor="w",
-                                    font=app.app_font, bg=th["card_bg"],
+                                    font=app.font_title, bg=th["card_bg"],
                                     fg=th["fg"], cursor="fleur")
         self.title_label.pack(fill="x")
 
         self.desc_var = tk.StringVar(value=description)
+        # P8 字号层级：描述缩小一号 + 次级文字色
         self.desc_entry = tk.Entry(mid, textvariable=self.desc_var,
-                                   font=app.app_font, relief="flat",
-                                   bg=th["desc_bg"], fg=th["fg"],
+                                   font=app.font_desc, relief="flat",
+                                   bg=th["desc_bg"], fg=th["fg_secondary"],
                                    insertbackground=th["fg"],
                                    readonlybackground=th["desc_bg"])
         self.desc_entry.pack(fill="x", pady=(3, 0))
         self.desc_entry.bind("<FocusOut>", lambda e: self._sync_desc())
         self.desc_entry.bind("<Return>", lambda e: self._sync_desc())
 
-        self.del_btn = tk.Button(self, text="\u274C",  # ❌
-                                 width=3, font=app.app_font, relief="flat",
-                                 bg=th["card_bg"], fg=th["danger_fg"],
+        self.del_btn = tk.Button(self, text="\u2715",  # ✕（较 ❌ 更利落）
+                                 width=3, font=app.font_desc, relief="flat",
+                                 bd=0, cursor="hand2",
+                                 bg=th["card_bg"], fg=th["fg_secondary"],
                                  activebackground=th["danger_active_bg"],
+                                 activeforeground=th["danger_fg"],
                                  command=self._on_delete)
         self.del_btn.pack(side="right", padx=(8, 0))
+        self.del_btn.bind("<Enter>", self._on_del_enter, add="+")
+        self.del_btn.bind("<Leave>", self._on_del_leave, add="+")
+
+        # P8 hover：整卡悬停高亮（进入子控件不算离开）
+        self.bind("<Enter>", lambda e: self._set_hover(True), add="+")
+        self.bind("<Leave>", self._on_pointer_leave, add="+")
 
         # 拖拽 & 双击（不绑 Entry / 删除按钮，避免影响文本编辑与点击）
         for w in (self, mid, self.icon_label, self.title_label):
@@ -98,18 +113,85 @@ class ShortcutCard(tk.Frame):
 
         # 主题注册（重构 P5：切主题时由 ThemeManager 统一刷新）
         tm = app.tm
-        tm.register(self, bg="card_bg")
+        tm.register(self, bg="card_bg", highlightbackground="border",
+                    highlightcolor="border")
         tm.register(self.icon_label, bg="card_bg")
         tm.register(mid, bg="card_bg")
         tm.register(self.title_label, bg="card_bg", fg="fg")
-        tm.register(self.desc_entry, bg="desc_bg", fg="fg",
+        tm.register(self.desc_entry, bg="desc_bg", fg="fg_secondary",
                     insertbackground="fg", readonlybackground="desc_bg")
-        tm.register(self.del_btn, bg="card_bg", fg="danger_fg",
-                    activebackground="danger_active_bg")
+        tm.register(self.del_btn, bg="card_bg", fg="fg_secondary",
+                    activebackground="danger_active_bg",
+                    activeforeground="danger_fg")
 
         # widget 就绪后再入队异步提取（结果经主线程轮询回填）
         if pending_async:
             app.request_icon(self)
+
+    # ---- hover / 启动反馈（P8 视觉升级） ----
+    def _set_hover(self, on):
+        self._hovered = bool(on)
+        th = self.app.theme
+        bg = th["card_hover_bg"] if on else th["card_bg"]
+        border = th["border_strong"] if on else th["border"]
+        try:
+            self.configure(bg=bg, highlightbackground=border,
+                           highlightcolor=border)
+            for w in (self.icon_label, self.mid, self.title_label):
+                w.configure(bg=bg)
+            self.del_btn.configure(bg=bg)
+        except tk.TclError:
+            pass
+
+    def _on_pointer_leave(self, _e):
+        """离开事件也会在进入子控件时触发（NotifyInferior），
+        指针仍在卡片矩形内则维持 hover。"""
+        try:
+            x, y = self.winfo_pointerxy()
+            rx, ry = self.winfo_rootx(), self.winfo_rooty()
+            if (rx <= x < rx + self.winfo_width()
+                    and ry <= y < ry + self.winfo_height()):
+                return
+        except tk.TclError:
+            pass
+        self._set_hover(False)
+
+    def _on_del_enter(self, _e):
+        th = self.app.theme
+        try:
+            self.del_btn.configure(bg=th["danger_hover_bg"],
+                                   fg=th["danger_fg"])
+        except tk.TclError:
+            pass
+
+    def _on_del_leave(self, _e):
+        th = self.app.theme
+        bg = th["card_hover_bg"] if self._hovered else th["card_bg"]
+        try:
+            self.del_btn.configure(bg=bg, fg=th["fg_secondary"])
+        except tk.TclError:
+            pass
+
+    def flash_launch(self):
+        """双击启动成功的视觉确认：描边闪两下 accent 色。"""
+        th = self.app.theme
+        seq = [th["accent"], th["border"], th["accent"], th["border"]]
+
+        def step(i=0):
+            if i >= len(seq):
+                self._flash_job = None
+                # 收尾按当前 hover 状态恢复
+                self._set_hover(self._hovered)
+                return
+            try:
+                self.configure(highlightbackground=seq[i],
+                               highlightcolor=seq[i])
+            except tk.TclError:
+                return
+            self._flash_job = self.after(110, lambda: step(i + 1))
+
+        if self._flash_job is None:
+            step()
 
     # ---- 数据转发（重构 P4：业务字段的唯一真源是 self.item） ----
     @property

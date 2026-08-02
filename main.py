@@ -240,6 +240,12 @@ class App(_TK_BASE):
             family=self.cfg["font"].get("family", BUILTIN_FONT_FAMILY),
             size=int(self.cfg["font"].get("size", 12))
         )
+        # 字号层级（P8 视觉升级）：标题加粗放大一号 / 描述次级缩小一号
+        _fam = self.app_font.cget("family")
+        _size = int(self.app_font.cget("size"))
+        self.font_title = tkFont.Font(family=_fam, size=_size + 1,
+                                      weight="bold")
+        self.font_desc = tkFont.Font(family=_fam, size=max(8, _size - 1))
         # 卡片宽度（运行时可调，实时影响所有 folder 的 grid 列宽）
         try:
             self.card_width = int(self.cfg.get("card_width", 500))
@@ -418,7 +424,9 @@ class App(_TK_BASE):
         self.bottom_frame = bottom
 
         # 全局字体设置卡片
-        font_card = tk.Frame(bottom, bd=1, relief="solid",
+        font_card = tk.Frame(bottom, bd=0, highlightthickness=1,
+                             highlightbackground=th["border"],
+                             highlightcolor=th["border"],
                              padx=8, pady=6, bg=th["panel_bg"])
         font_card.pack(side="bottom", fill="x", padx=8, pady=(0, 8))
         self.font_card = font_card
@@ -561,7 +569,7 @@ class App(_TK_BASE):
         self.add_btn = tk.Button(
             toolbar, text="添加快捷方式",
             font=self.app_font, command=self._on_add,
-            padx=10, pady=4,
+            padx=12, pady=5, relief="flat", bd=0, cursor="hand2",
             bg=th["btn_bg"], fg=th["fg"],
             activebackground=th["btn_active_bg"], activeforeground=th["fg"]
         )
@@ -570,7 +578,7 @@ class App(_TK_BASE):
         self.multi_add_btn = tk.Button(
             toolbar, text="多选添加快捷方式",
             font=self.app_font, command=self._on_multi_add,
-            padx=10, pady=4,
+            padx=12, pady=5, relief="flat", bd=0, cursor="hand2",
             bg=th["btn_bg"], fg=th["fg"],
             activebackground=th["btn_active_bg"], activeforeground=th["fg"]
         )
@@ -579,7 +587,7 @@ class App(_TK_BASE):
         self.new_folder_btn = tk.Button(
             toolbar, text="新建文件夹",
             font=self.app_font, command=self._on_new_folder,
-            padx=10, pady=4,
+            padx=12, pady=5, relief="flat", bd=0, cursor="hand2",
             bg=th["btn_bg"], fg=th["fg"],
             activebackground=th["btn_active_bg"], activeforeground=th["fg"]
         )
@@ -588,7 +596,7 @@ class App(_TK_BASE):
         self.add_dir_btn = tk.Button(
             toolbar, text="添加文件夹快捷方式",
             font=self.app_font, command=self._on_add_dir,
-            padx=10, pady=4,
+            padx=12, pady=5, relief="flat", bd=0, cursor="hand2",
             bg=th["btn_bg"], fg=th["fg"],
             activebackground=th["btn_active_bg"], activeforeground=th["fg"]
         )
@@ -597,7 +605,7 @@ class App(_TK_BASE):
         self.multi_add_dir_btn = tk.Button(
             toolbar, text="多选添加文件夹快捷方式",
             font=self.app_font, command=self._on_multi_add_dir,
-            padx=10, pady=4,
+            padx=12, pady=5, relief="flat", bd=0, cursor="hand2",
             bg=th["btn_bg"], fg=th["fg"],
             activebackground=th["btn_active_bg"], activeforeground=th["fg"]
         )
@@ -606,7 +614,7 @@ class App(_TK_BASE):
         self.open_dir_btn = tk.Button(
             toolbar, text="打开程序目录",
             font=self.app_font, command=self._on_open_app_dir,
-            padx=10, pady=4,
+            padx=12, pady=5, relief="flat", bd=0, cursor="hand2",
             bg=th["btn_bg"], fg=th["fg"],
             activebackground=th["btn_active_bg"], activeforeground=th["fg"]
         )
@@ -662,7 +670,16 @@ class App(_TK_BASE):
         tm.register(self.inner_frame, bg="app_bg")
         tm.register(self.flat_view, bg="folder_bg")
         tm.register(self._flat_empty_label, bg="folder_bg", fg="fg")
-        tm.register(self.font_card, bg="panel_bg")
+        tm.register(self.font_card, bg="panel_bg",
+                    highlightbackground="border", highlightcolor="border")
+
+        # P8 hover：工具栏按钮 + 卡宽箭头
+        from quickdeck.ui.widgets.hover import bind_hover
+        for _b in (self.add_btn, self.multi_add_btn, self.new_folder_btn,
+                   self.add_dir_btn, self.multi_add_dir_btn,
+                   self.open_dir_btn,
+                   self.card_width_arrow_up, self.card_width_arrow_dn):
+            bind_hover(self, _b, "btn_bg", "btn_hover_bg")
         for lbl in self._panel_labels:
             tm.register(lbl, bg="panel_bg", fg="fg")
         for spin in (self.font_size_spin, self.card_width_spin):
@@ -708,10 +725,23 @@ class App(_TK_BASE):
                 "TCombobox",
                 fieldbackground=[("readonly", th["desc_bg"])],
                 foreground=[("readonly", th["fg"])])
+            # P8：无箭头细条现代滚动条
+            self.style.layout(
+                "Vertical.TScrollbar",
+                [("Vertical.Scrollbar.trough",
+                  {"children": [("Vertical.Scrollbar.thumb",
+                                 {"expand": "1", "sticky": "nswe"})],
+                   "sticky": "ns"})])
             self.style.configure(
                 "Vertical.TScrollbar",
-                background=th["btn_bg"], troughcolor=th["app_bg"],
-                arrowcolor=th["fg"])
+                background=th["border_strong"], troughcolor=th["app_bg"],
+                bordercolor=th["app_bg"], lightcolor=th["border_strong"],
+                darkcolor=th["border_strong"],
+                arrowsize=0, width=10, relief="flat")
+            self.style.map(
+                "Vertical.TScrollbar",
+                background=[("active", th["accent"]),
+                            ("pressed", th["accent"])])
             # 下拉列表（非 ttk 部分）用 option_add
             self.option_add("*TCombobox*Listbox.background", th["desc_bg"])
             self.option_add("*TCombobox*Listbox.foreground", th["fg"])
@@ -1457,6 +1487,11 @@ class App(_TK_BASE):
         # 不立即重排——卡片在鼠标下瞬移体验很差，下次进入该视图时生效
         card.launch_count += 1
         card.last_launch_ts = time.time()
+        # P8：启动成功的视觉确认（描边闪 accent）
+        try:
+            card.flash_launch()
+        except Exception:
+            pass
         self.mark_dirty()
 
     # ============================================================
@@ -1547,6 +1582,9 @@ class App(_TK_BASE):
                 and size == int(self.app_font.cget("size"))):
             return
         self.app_font.configure(family=family, size=size)
+        # 层级字体跟随（P8）
+        self.font_title.configure(family=family, size=size + 1)
+        self.font_desc.configure(family=family, size=max(8, size - 1))
         self._apply_style_font()
         # 字体变化时同步刷新 folder header 用的小号字
         for f in self.folders:
