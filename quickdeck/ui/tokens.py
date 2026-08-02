@@ -20,6 +20,7 @@ LIGHT_THEME = {
     "header_active_bg": "#D0D0D0",
     "btn_bg": "#F0F0F0",           # 工具栏按钮
     "btn_active_bg": "#E2E2E2",
+    "accent": "#2F6FEB",           # 强调色（拖拽指示线等；P8 全面启用）
 }
 
 DARK_THEME = {
@@ -37,4 +38,5 @@ DARK_THEME = {
     "header_active_bg": "#454545",
     "btn_bg": "#3A3A3A",
     "btn_active_bg": "#4A4A4A",
+    "accent": "#4C8DFF",
 }

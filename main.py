@@ -66,6 +66,8 @@ from quickdeck.ui.tokens import LIGHT_THEME, DARK_THEME
 from quickdeck.ui.theme import ThemeManager
 # ---- 重构 P6：布局纯函数 ----
 from quickdeck.ui.layout import compute_cols
+# ---- 重构 P7：拖拽控制器 ----
+from quickdeck.ui.dnd import DragController
 from quickdeck.platform.win32_paint import PaintGuard
 
 
@@ -258,8 +260,8 @@ class App(_TK_BASE):
 
         # 状态
         self.folders = []
-        self.dragging_card = None
-        self.dragging_folder = None
+        # 拖拽控制器（重构 P7：幽灵卡 + 指示线 + 松手 commit）
+        self.dnd = DragController(self)
         self._save_timer = None
         self._font_apply_timer = None
         # 保存收口（重构 P4）：mark_dirty 置脏 + 400ms 防抖 flush
@@ -1640,141 +1642,27 @@ class App(_TK_BASE):
     # ============================================================
     # 卡片拖拽（可跨文件夹）
     # ============================================================
+    # ============================================================
+    # 拖拽（重构 P7：幽灵卡 + 指示线 + 松手 commit，
+    # 实现见 quickdeck.ui.dnd.DragController；此处保留薄委托供控件调用）
+    # ============================================================
     def card_drag_start(self, card, event):
-        # usage 视图为临时只读视图，禁止拖拽；
-        # cards 视图只允许文件夹分组区卡片拖拽；
-        # web / dirs 视图只允许各自独立区卡片排序
-        if self.view_mode == "usage":
-            return
-        if self.view_mode == "web" and card not in self.web_cards:
-            return
-        if self.view_mode == "dirs" and card not in self.dir_cards:
-            return
-        if self.view_mode == "cards" and (card in self.web_cards
-                                          or card in self.dir_cards):
-            return
-        self.dragging_card = card
-        self.dragging_folder = None
+        self.dnd.card_start(card, event)
 
     def card_drag_motion(self, card, event):
-        if self.dragging_card is not card:
-            return
-        # 独立区排序：在对应列表内移动，不涉及 folder
-        if self.view_mode == "web":
-            self._area_drag_motion(card, event, "web_cards")
-            return
-        if self.view_mode == "dirs":
-            self._area_drag_motion(card, event, "dir_cards")
-            return
-        x, y = event.x_root, event.y_root
-        target_folder = self._folder_at_y(y)
-        if target_folder is None:
-            return
-        # 折叠的文件夹卡片区不可见，不作为拖拽落点（避免卡片"拖进去就消失"）
-        if getattr(target_folder, "collapsed", False) \
-                and target_folder is not card.folder:
-            return
-        target_pos = self._insert_position_in_folder(target_folder, x, y, card)
-        self._move_card_to(card, target_folder, target_pos)
-
-    def _area_drag_motion(self, card, event, attr):
-        """独立存储区视图（web / dirs）内拖拽排序：按鼠标位置找最近卡片
-        决定插入点，与 _insert_position_in_folder 同一套判定逻辑。
-        attr 为存储列表的属性名（"web_cards" / "dir_cards"）。"""
-        cards = getattr(self, attr)
-        others = [c for c in cards if c is not card]
-        if not others:
-            return
-        x, y = event.x_root, event.y_root
-        best_i, best_d = 0, float("inf")
-        for i, c in enumerate(others):
-            try:
-                cx = c.winfo_rootx() + c.winfo_width() / 2
-                cy = c.winfo_rooty() + c.winfo_height() / 2
-            except tk.TclError:
-                continue
-            d = (cx - x) ** 2 + (cy - y) ** 2
-            if d < best_d:
-                best_d, best_i = d, i
-        bc = others[best_i]
-        ccx = bc.winfo_rootx() + bc.winfo_width() / 2
-        ccy = bc.winfo_rooty() + bc.winfo_height() / 2
-        if y < ccy - bc.winfo_height() / 3:
-            pos = best_i
-        elif y > ccy + bc.winfo_height() / 3:
-            pos = best_i + 1
-        else:
-            pos = best_i if x < ccx else best_i + 1
-        new_order = others[:pos] + [card] + others[pos:]
-        if new_order == cards:
-            return
-        setattr(self, attr, new_order)
-        self._reflow_flat(new_order)
+        self.dnd.card_motion(card, event)
 
     def card_drag_end(self, card, event):
-        if self.dragging_card is card:
-            self.dragging_card = None
-            if self.view_mode in ("web", "dirs"):
-                self.mark_dirty()
-                return
-            # 拖拽过程中每次 motion 都做过局部 reflow，但如果最后落点是刚
-            # 新建的空文件夹，body 尚未完成首次布局，卡片可能显示不出。
-            # 收尾时对所有 folder 强制走一次完整 reflow + 顶层 update，
-            # 保证卡片最终一定可见。
-            for f in list(self.folders):
-                try:
-                    f._reflow()
-                except Exception:
-                    pass
-            try:
-                self.update()
-            except Exception:
-                pass
-            self.mark_dirty()
+        self.dnd.card_end(card, event)
 
-    def _folder_at_y(self, y_root):
-        # 优先命中：鼠标落在某个 folder 的 y 范围内
-        for f in self.folders:
-            try:
-                top = f.winfo_rooty()
-                bot = top + f.winfo_height()
-            except tk.TclError:
-                continue
-            if top <= y_root <= bot:
-                return f
-        # 没命中：按 y 距离最近的 folder 吸附
-        best_f, best_d = None, float("inf")
-        for f in self.folders:
-            try:
-                top = f.winfo_rooty()
-                cy = top + f.winfo_height() / 2
-            except tk.TclError:
-                continue
-            d = abs(y_root - cy)
-            if d < best_d:
-                best_d, best_f = d, f
-        return best_f
+    def folder_drag_start(self, folder, event):
+        self.dnd.folder_start(folder, event)
 
-    def _insert_position_in_folder(self, folder, x_root, y_root, dragging_card):
-        others = [c for c in folder.cards if c is not dragging_card]
-        if not others:
-            return 0
-        best_i, best_d = 0, float("inf")
-        for i, c in enumerate(others):
-            cx = c.winfo_rootx() + c.winfo_width() / 2
-            cy = c.winfo_rooty() + c.winfo_height() / 2
-            d = (cx - x_root) ** 2 + (cy - y_root) ** 2
-            if d < best_d:
-                best_d, best_i = d, i
-        bc = others[best_i]
-        ccx = bc.winfo_rootx() + bc.winfo_width() / 2
-        ccy = bc.winfo_rooty() + bc.winfo_height() / 2
-        # 跨行：以中心 y 为界；同一行内：以中心 x 为界
-        if y_root < ccy - bc.winfo_height() / 3:
-            return best_i
-        if y_root > ccy + bc.winfo_height() / 3:
-            return best_i + 1
-        return best_i if x_root < ccx else best_i + 1
+    def folder_drag_motion(self, folder, event):
+        self.dnd.folder_motion(folder, event)
+
+    def folder_drag_end(self, folder, event):
+        self.dnd.folder_end(folder, event)
 
     def _move_card_to(self, card, target_folder, target_pos):
         src_folder = card.folder
@@ -1816,52 +1704,6 @@ class App(_TK_BASE):
             self.update_idletasks()
         except Exception:
             pass
-
-    # ============================================================
-    # 文件夹拖拽（换整个文件夹在列表里的顺序）
-    # ============================================================
-    def folder_drag_start(self, folder, event):
-        self.dragging_folder = folder
-        self.dragging_card = None
-
-    def folder_drag_motion(self, folder, event):
-        if self.dragging_folder is not folder:
-            return
-        if len(self.folders) <= 1:
-            return
-        y = event.y_root
-        others = [f for f in self.folders if f is not folder]
-        target_pos = 0
-        for f in others:
-            try:
-                top = f.winfo_rooty()
-                h = f.winfo_height()
-            except tk.TclError:
-                return
-            if y > top + h / 2:
-                target_pos += 1
-            else:
-                break
-        new_order = others[:target_pos] + [folder] + others[target_pos:]
-        if new_order == self.folders:
-            return
-        self.folders = new_order
-        for f in self.folders:
-            try:
-                f.pack_forget()
-            except Exception:
-                pass
-        for f in self.folders:
-            f.pack(fill="x", padx=6, pady=(6, 0))
-        try:
-            self.inner_frame.update_idletasks()
-        except Exception:
-            pass
-
-    def folder_drag_end(self, folder, event):
-        if self.dragging_folder is folder:
-            self.dragging_folder = None
-            self.mark_dirty()
 
     # ============================================================
     # 状态持久化
