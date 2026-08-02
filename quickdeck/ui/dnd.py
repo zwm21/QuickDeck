@@ -71,6 +71,16 @@ class DragController:
             others = [c for c in cards if c is not card]
             pos = self._pos_among(others, x, y)
             self._target = ("area", attr, pos)
+            if pos == cards.index(card):
+                # 停留原位（同文件夹逻辑一致）
+                try:
+                    self._place_indicator(card.winfo_rootx() - 4,
+                                          card.winfo_rooty(),
+                                          INDICATOR_WIDTH,
+                                          card.winfo_height())
+                except tk.TclError:
+                    pass
+                return
             self._show_indicator_at(others, pos, app.flat_view)
             return
 
@@ -87,6 +97,18 @@ class DragController:
         others = [c for c in target_folder.cards if c is not card]
         pos = self._pos_among(others, x, y)
         self._target = ("folder", target_folder, pos)
+        # 停留原位：落点就是当前位置时，把指示线画在自己左缘，
+        # 明确传达"松手后不会移动"
+        if (target_folder is card.folder
+                and pos == target_folder.cards.index(card)):
+            try:
+                self._place_indicator(card.winfo_rootx() - 4,
+                                      card.winfo_rooty(),
+                                      INDICATOR_WIDTH,
+                                      card.winfo_height())
+            except tk.TclError:
+                pass
+            return
         self._show_indicator_at(others, pos, target_folder.body)
 
     def card_end(self, card, event):

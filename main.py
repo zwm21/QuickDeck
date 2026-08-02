@@ -1703,6 +1703,13 @@ class App(_TK_BASE):
         self.dnd.folder_end(folder, event)
 
     def _move_card_to(self, card, target_folder, target_pos):
+        """把 card 移到 target_folder。
+
+        target_pos 语义（P7 修正）：在「不含 card 的目标卡片序列」中的
+        插入下标，即移动完成后 card 的最终下标。旧实现按"含 card 的
+        全列表下标"再做 -1 修正，与 DragController._pos_among 的输出
+        语义错位——同文件夹向后拖会差一位（拖到相邻下一位变成原地不动）。
+        """
         src_folder = card.folder
         # 明确解除 card 现有的 grid 绑定，避免 in_ 从 src.body 换到
         # target.body 时 tk 遗留状态导致新位置不可见
@@ -1713,11 +1720,10 @@ class App(_TK_BASE):
 
         if src_folder is target_folder:
             cur = src_folder.cards.index(card)
-            # 同文件夹内：把 target_pos 修正为"移除 card 后的目标位置"
-            if target_pos > cur:
-                target_pos -= 1
             if cur == target_pos:
-                # 顺序未变，也要把刚才 grid_forget 的 card 补回原位
+                # 停留原位：顺序未变，但要把刚才 grid_forget 的 card
+                # 补回原位（列表未变会命中增量短路，需显式失效）
+                src_folder.invalidate_grid()
                 src_folder._reflow()
                 return
             src_folder.cards.remove(card)

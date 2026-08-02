@@ -77,17 +77,49 @@ check("幽灵已销毁", dnd._ghost is None)
 check("指示线已隐藏", not dnd._indicator.place_info())
 check("卡片可见（已 grid）", bool(card.grid_info()))
 
-# ---- 3. 同文件夹重排：拖到末尾 ----
-if len(dst.cards) >= 2:
-    last = dst.cards[-1]
-    lx = last.winfo_rootx() + last.winfo_width() - 5
-    ly = last.winfo_rooty() + last.winfo_height() - 5
-    dnd.card_start(card, E(cx, cy))
-    dnd.card_motion(card, E(cx + 30, cy + 30))
-    dnd.card_motion(card, E(lx, ly))
-    dnd.card_end(card, E(lx, ly))
+# ---- 3. 同文件夹重排（P7 语义修正：pos = 排除自身后的最终下标） ----
+def drag_to(c, tx_, ty_):
+    sx = c.winfo_rootx() + 10
+    sy = c.winfo_rooty() + 10
+    dnd.card_start(c, E(sx, sy))
+    dnd.card_motion(c, E(sx + 30, sy + 30))
+    dnd.card_motion(c, E(tx_, ty_))
+    dnd.card_end(c, E(tx_, ty_))
     app.update()
+
+
+# 先把测试卡移回源文件夹，保证存在一个 >=3 卡的未锁定文件夹
+app.move_card_to_folder(card, src)
+app.update()
+f2 = next((f for f in app.folders
+           if len(f.cards) >= 3 and not f.locked and not f.collapsed), None)
+if f2 is not None:
+    dst = f2
+    card = dst.cards[0]
+    # 3a. 拖到相邻下一位（旧实现因双重 -1 修正而原地不动的 bug 场景）
+    nxt = dst.cards[1]
+    drag_to(card, nxt.winfo_rootx() + nxt.winfo_width() - 5,
+            nxt.winfo_rooty() + nxt.winfo_height() // 2)
+    check("拖到相邻下一位生效", dst.cards.index(card) == 1)
+
+    # 3b. 拖到末尾
+    last = dst.cards[-1]
+    drag_to(card, last.winfo_rootx() + last.winfo_width() - 5,
+            last.winfo_rooty() + last.winfo_height() - 5)
     check("同文件夹拖至末尾", dst.cards.index(card) == len(dst.cards) - 1)
+
+    # 3c. 停留原位：拖起后落回自己身上，顺序不变且卡片可见
+    order_now = list(dst.cards)
+    drag_to(card, card.winfo_rootx() + card.winfo_width() // 2,
+            card.winfo_rooty() + card.winfo_height() // 2)
+    check("落回原位顺序不变", list(dst.cards) == order_now)
+    check("落回原位卡片可见", bool(card.grid_info()))
+
+    # 3d. 拖回开头
+    first = dst.cards[0]
+    drag_to(card, first.winfo_rootx() + 3,
+            first.winfo_rooty() + first.winfo_height() // 2)
+    check("拖回开头", dst.cards.index(card) == 0)
 
 # ---- 4. 锁定文件夹：控件层拦截 ----
 locked_f = next((f for f in app.folders if f.locked and f.cards), None)
