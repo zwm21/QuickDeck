@@ -61,7 +61,7 @@ class ShortcutCard(tk.Frame):
         if self.custom_icon:
             pil = self._load_icon_file(self.custom_icon)
         if pil is None and self.app.has_win32:
-            pil = self.app.icon_cache.get(path)
+            pil = self.app.icon_cache.get(path, app.icon_size)
         if pil is None:
             pil = app.default_icon_img
             pending_async = self.app.has_win32
@@ -288,21 +288,44 @@ class ShortcutCard(tk.Frame):
             pass  # 卡片可能已被销毁
 
     # ---- 自定义图标 ----
-    @staticmethod
-    def _load_icon_file(icon_path):
-        """从 .ico/.png/.jpg 等图像文件加载卡片图标；失败返回 None。"""
+    def _load_icon_file(self, icon_path):
+        """从 .ico/.png/.jpg 等图像文件加载卡片图标；失败返回 None。
+        尺寸按当前档位（P8c）。"""
         try:
             if not icon_path or not os.path.exists(icon_path):
                 return None
             img = Image.open(icon_path)
             if img.mode != "RGBA":
                 img = img.convert("RGBA")
-            img = img.resize((ICON_SIZE, ICON_SIZE), Image.LANCZOS)
+            size = getattr(self.app, "icon_size", ICON_SIZE)
+            img = img.resize((size, size), Image.LANCZOS)
             return img
         except Exception as e:
             print(f"[QuickDeck] load custom icon failed: {e}",
                   file=sys.stderr)
             return None
+
+    def reload_icon_for_size(self):
+        """图标档位变化（卡宽跨档）时按新尺寸重载：
+        自定义图标同步重载；提取图标先查新尺寸缓存，未命中回落
+        占位图并重新入队异步提取。"""
+        app = self.app
+        if self.custom_icon:
+            pil = self._load_icon_file(self.custom_icon)
+            if pil is not None:
+                self.icon_pil = pil
+                self.icon_photo = ImageTk.PhotoImage(pil)
+                self.icon_label.configure(image=self.icon_photo)
+            return
+        if not app.has_win32:
+            return
+        pil = app.icon_cache.get(self.path, app.icon_size)
+        if pil is not None:
+            self.set_extracted_icon(pil)
+            return
+        if app.default_icon_img is not None:
+            self.set_extracted_icon(app.default_icon_img)
+        app.request_icon(self)
 
     def set_custom_icon(self, icon_path):
         """替换图标；icon_path 为空字符串时恢复自动提取。"""
@@ -314,7 +337,7 @@ class ShortcutCard(tk.Frame):
                     "替换图标失败", f"无法读取图像文件：\n{icon_path}")
                 return False
         if pil is None and self.app.has_win32:
-            pil = get_icon_for_file(self.path)
+            pil = get_icon_for_file(self.path, self.app.icon_size)
         if pil is None:
             pil = self.app.default_icon_img
         self.custom_icon = icon_path or ""

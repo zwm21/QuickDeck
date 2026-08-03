@@ -56,7 +56,9 @@ from quickdeck.platform.win32_icons import (
 from quickdeck.services.icon_cache import IconCache
 from quickdeck.services.icon_loader import IconLoader
 # ---- 重构 P3：配置层已拆分到 quickdeck.config ----
-from quickdeck.constants import ICON_SIZE, BUILTIN_FONT_FAMILY
+from quickdeck.constants import (
+    ICON_SIZE, BUILTIN_FONT_FAMILY, icon_size_for,
+)
 from quickdeck.config.schema import DEFAULT_CONFIG, default_config
 from quickdeck.config.store import ConfigStore
 # ---- 重构 P4：数据层（widget 只作渲染，业务数据在纯数据类） ----
@@ -261,7 +263,10 @@ class App(_TK_BASE):
         except tk.TclError:
             pass
 
-        self.default_icon_img = make_default_icon() if HAS_WIN32 else None
+        # P8c 图标分档：显示尺寸随卡宽档位（32/40/48）
+        self.icon_size = icon_size_for(self.card_width)
+        self.default_icon_img = (make_default_icon(self.icon_size)
+                                 if HAS_WIN32 else None)
         # 控件层依赖注入（重构 P5c：widgets 不再 import main 模块级对象）
         self.has_win32 = HAS_WIN32
         self.icon_cache = ICON_CACHE
@@ -355,7 +360,7 @@ class App(_TK_BASE):
         self._icon_task_seq += 1
         task_id = self._icon_task_seq
         self._icon_cards[task_id] = card
-        self._icon_loader.submit(task_id, card.path, ICON_SIZE)
+        self._icon_loader.submit(task_id, card.path, self.icon_size)
 
     def _poll_icon_results(self):
         """主线程轮询提取结果，回填到仍然存活的卡片上。
@@ -1640,6 +1645,17 @@ class App(_TK_BASE):
                 self._reflow_flat(self._flat_cards)
             except Exception:
                 pass
+        # P8c：跨过图标档位边界时按新尺寸重载全部图标
+        new_size = icon_size_for(v)
+        if new_size != self.icon_size:
+            self.icon_size = new_size
+            if HAS_WIN32:
+                self.default_icon_img = make_default_icon(new_size)
+            for c in self.every_card:
+                try:
+                    c.reload_icon_for_size()
+                except Exception:
+                    pass
         # 防抖保存
         if self._save_timer is not None:
             try:
