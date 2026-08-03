@@ -68,6 +68,8 @@ from quickdeck.ui.theme import ThemeManager
 from quickdeck.ui.layout import compute_cols
 # ---- 重构 P7：拖拽控制器 ----
 from quickdeck.ui.dnd import DragController
+# ---- P8b：圆角底图 ----
+from quickdeck.ui import images as ui_images
 from quickdeck.platform.win32_paint import PaintGuard
 
 
@@ -773,6 +775,13 @@ class App(_TK_BASE):
         不再逐控件硬编码枚举（旧版三处枚举极易漏刷新增控件）。"""
         self.theme = theme
         self.tm.apply(theme)
+        # P8b：旧配色的圆角底图整表失效，再逐卡按新主题重生成
+        ui_images.invalidate()
+        for c in self.every_card:
+            try:
+                c.refresh_surface()
+            except Exception:
+                pass
         self._apply_style_theme()
         self._apply_titlebar_dark()
         self._apply_class_bg_brush()

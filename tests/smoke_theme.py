@@ -30,7 +30,12 @@ def assert_theme(th, tag):
     card = app.folders[0].cards[0]
     f = app.folders[0]
     check(f"{tag}: root bg", app.cget("bg") == th["app_bg"])
-    check(f"{tag}: card bg", card.cget("bg") == th["card_bg"])
+    # P8b 起卡片本体为容器底色，卡面由圆角底图绘制
+    check(f"{tag}: card 外底色", card.cget("bg") == th["folder_bg"])
+    check(f"{tag}: 圆角底图配色",
+          card._surface_state is not None
+          and card._surface_state[2] == th["card_bg"]
+          and card._surface_state[3] == th["border_strong"])
     check(f"{tag}: card title fg",
           card.title_label.cget("fg") == th["fg"])
     check(f"{tag}: desc entry bg",
@@ -41,8 +46,6 @@ def assert_theme(th, tag):
     # P8 起删除按钮常态用次级色，hover 才显危险色
     check(f"{tag}: 删除按钮 fg",
           card.del_btn.cget("fg") == th["fg_secondary"])
-    check(f"{tag}: 卡片描边 border",
-          card.cget("highlightbackground") == th["border"])
 
 
 app.theme_mode = "dark"

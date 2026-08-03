@@ -15,6 +15,7 @@ from tkinter import filedialog, messagebox, simpledialog
 from PIL import Image, ImageTk
 
 from quickdeck.constants import ICON_SIZE
+from quickdeck.ui.images import rounded_card_image
 from quickdeck.platform.win32_icons import (
     get_icon_for_file, get_title_for_file,
 )
@@ -32,11 +33,16 @@ class ShortcutCard(tk.Frame):
         """item: quickdeck.model.workspace.Shortcut——卡片的业务数据
         全部存于纯数据对象（重构 P4），widget 属性仅作 property 转发。"""
         th = app.theme
-        # P8 视觉：描边用 highlight 系（可主题化），替代 relief="solid"
-        super().__init__(master, bd=0, padx=8, pady=6, bg=th["card_bg"],
-                         highlightthickness=1,
-                         highlightbackground=th["border"],
-                         highlightcolor=th["border"])
+        # P8b 视觉：圆角卡片——Frame 本体用容器底色（四角外露），
+        # 底层 Label 贴 PIL 预合成的圆角底图，子控件绘制在其上
+        super().__init__(master, bd=0, padx=10, pady=7,
+                         bg=th["folder_bg"], highlightthickness=0)
+        self._bg_label = tk.Label(self, bd=0, bg=th["folder_bg"])
+        # bordermode="outside"：覆盖含内边距的整卡区域（默认 inside
+        # 会被 Frame padx/pady 内缩，圆角图的边框区域整个被裁掉）
+        self._bg_label.place(x=0, y=0, relwidth=1, relheight=1,
+                             bordermode="outside")
+        self._surface_state = None  # (w, h, hover/flash 变体标记)
         self.app = app
         self.item = item
         self.folder = None  # 由 FolderFrame.add_card / insert_card 设置
@@ -102,6 +108,16 @@ class ShortcutCard(tk.Frame):
         # P8 hover：整卡悬停高亮（进入子控件不算离开）
         self.bind("<Enter>", lambda e: self._set_hover(True), add="+")
         self.bind("<Leave>", self._on_pointer_leave, add="+")
+        # P8b：尺寸变化时重生成圆角底图（含首次布局）
+        self.bind("<Configure>", self._on_surface_configure, add="+")
+        # 底图 Label 沉底 + 与卡片同一套拖拽/双击/右键交互
+        self._bg_label.lower()
+        for _ev, _fn in (("<ButtonPress-1>", self._on_drag_start),
+                         ("<B1-Motion>", self._on_drag_motion),
+                         ("<ButtonRelease-1>", self._on_drag_end),
+                         ("<Double-Button-1>", self._on_double_click),
+                         ("<Button-3>", self._on_right_click)):
+            self._bg_label.bind(_ev, _fn)
 
         # 拖拽 & 双击（不绑 Entry / 删除按钮，避免影响文本编辑与点击）
         for w in (self, mid, self.icon_label, self.title_label):
@@ -111,10 +127,11 @@ class ShortcutCard(tk.Frame):
             w.bind("<Double-Button-1>", self._on_double_click)
             w.bind("<Button-3>", self._on_right_click)
 
-        # 主题注册（重构 P5：切主题时由 ThemeManager 统一刷新）
+        # 主题注册（重构 P5：切主题时由 ThemeManager 统一刷新；
+        # 圆角底图不走注册表，由 App 在主题切换后调 refresh_surface）
         tm = app.tm
-        tm.register(self, bg="card_bg", highlightbackground="border",
-                    highlightcolor="border")
+        tm.register(self, bg="folder_bg")
+        tm.register(self._bg_label, bg="folder_bg")
         tm.register(self.icon_label, bg="card_bg")
         tm.register(mid, bg="card_bg")
         tm.register(self.title_label, bg="card_bg", fg="fg")
@@ -128,20 +145,49 @@ class ShortcutCard(tk.Frame):
         if pending_async:
             app.request_icon(self)
 
-    # ---- hover / 启动反馈（P8 视觉升级） ----
+    # ---- 圆角底图 / hover / 启动反馈（P8 视觉升级） ----
+    def _on_surface_configure(self, event):
+        if (event.width, event.height) != (self._surface_state or
+                                           (None, None))[:2]:
+            self.refresh_surface()
+
+    def refresh_surface(self, flash_accent=False):
+        """按当前尺寸/主题/hover 状态重生成圆角底图。
+        主题切换后由 App 统一调用（images 缓存已 invalidate）。"""
+        th = self.app.theme
+        try:
+            w, h = self.winfo_width(), self.winfo_height()
+        except tk.TclError:
+            return
+        if w <= 4 or h <= 4:
+            return
+        if flash_accent:
+            fill, outline = th["card_bg"], th["accent"]
+        elif self._hovered:
+            fill, outline = th["card_hover_bg"], th["accent"]
+        else:
+            fill, outline = th["card_bg"], th["border_strong"]
+        try:
+            photo = rounded_card_image(w, h, 8, fill, outline,
+                                       th["folder_bg"])
+            self._bg_label.configure(image=photo, bg=th["folder_bg"])
+            self._bg_photo = photo  # 持引用防被 GC
+            self._surface_state = (w, h, fill, outline)
+        except tk.TclError:
+            pass
+
     def _set_hover(self, on):
         self._hovered = bool(on)
         th = self.app.theme
         bg = th["card_hover_bg"] if on else th["card_bg"]
-        border = th["border_strong"] if on else th["border"]
         try:
-            self.configure(bg=bg, highlightbackground=border,
-                           highlightcolor=border)
             for w in (self.icon_label, self.mid, self.title_label):
                 w.configure(bg=bg)
             self.del_btn.configure(bg=bg)
         except tk.TclError:
             pass
+        if self._flash_job is None:
+            self.refresh_surface()
 
     def _on_pointer_leave(self, _e):
         """离开事件也会在进入子控件时触发（NotifyInferior），
@@ -173,21 +219,15 @@ class ShortcutCard(tk.Frame):
             pass
 
     def flash_launch(self):
-        """双击启动成功的视觉确认：描边闪两下 accent 色。"""
-        th = self.app.theme
-        seq = [th["accent"], th["border"], th["accent"], th["border"]]
+        """双击启动成功的视觉确认：圆角描边闪两下 accent 色。"""
+        seq = [True, False, True, False]
 
         def step(i=0):
             if i >= len(seq):
                 self._flash_job = None
-                # 收尾按当前 hover 状态恢复
-                self._set_hover(self._hovered)
+                self.refresh_surface()
                 return
-            try:
-                self.configure(highlightbackground=seq[i],
-                               highlightcolor=seq[i])
-            except tk.TclError:
-                return
+            self.refresh_surface(flash_accent=seq[i])
             self._flash_job = self.after(110, lambda: step(i + 1))
 
         if self._flash_job is None:
