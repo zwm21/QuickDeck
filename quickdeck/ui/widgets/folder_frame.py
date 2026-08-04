@@ -17,10 +17,6 @@ class FolderFrame(tk.Frame):
     这样跨文件夹移动卡片时不用销毁 / 重建，也就不用重新提取图标。
     """
 
-    # 每列宽度单位：卡片宽度 + 一点 padding 余量；从 app.card_width 动态取
-    @property
-    def _CARD_UNIT(self):
-        return int(self.app.card_width) + 10
 
     def __init__(self, master, app, meta):
         """meta: quickdeck.model.workspace.Folder——文件夹元数据

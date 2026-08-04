@@ -1,6 +1,6 @@
 # QuickDeck
 
-Windows 桌面快捷方式管理器。以卡片形式管理 `.lnk` / `.exe` / `.url` 快捷方式与常用文件夹，支持文件夹分组、拖拽排序、拖放添加与全局字体调节。基于 Python 标准库 tkinter 开发，单文件源码（`main.py`），可用 PyInstaller 打包为独立 exe。
+Windows 桌面快捷方式管理器。以卡片形式管理 `.lnk` / `.exe` / `.url` 快捷方式与常用文件夹，支持文件夹分组、拖拽排序、拖放添加与全局字体调节。基于 Python 标准库 tkinter 开发，源码为 `quickdeck/` 分层包结构（`main.py` 为入口壳），可用 PyInstaller 打包为独立 exe。
 
 ## 功能
 
@@ -31,8 +31,10 @@ Windows 桌面快捷方式管理器。以卡片形式管理 `.lnk` / `.exe` / `.
 - 文件夹折叠（▾/▸ 按钮）：收起后隐藏整个卡片区、仅保留文件夹标题栏；与上锁相互独立，可同时或分别生效；折叠状态持久化
 
 ### 布局与外观
-- 卡片宽度可调（200–1200px，底部控件支持长按 ▲/▼ 连续调节），窗口足够宽时自动多列排布
-- 全局字体家族与字号（8–36）实时调节
+- **现代扁平视觉**：蓝色系 accent 配色，PIL 预合成的圆角卡片（平滑圆角 + 1px 描边），卡片整卡 hover 高亮、双击启动描边闪烁确认，删除按钮悬停才显现危险色；无箭头细条滚动条（悬停变 accent）
+- **拖拽体验**：按住拖动出现半透明幽灵卡跟随鼠标，accent 色指示线实时预示插入位置（落点为原位时指示线贴在卡片自身左缘），松手才真正移动——拖动过程中布局不抖动；文件夹拖拽同样带幽灵与横向指示线
+- 卡片宽度可调（200–1200px，底部控件支持长按 ▲/▼ 连续调节），窗口足够宽时自动多列排布；**图标随卡宽分档缩放**（<380px→32px，<520px→40px，≥520px→48px）
+- 全局字体家族与字号（8–36）实时调节；字号分层：文件夹名/卡片标题加粗、描述用小一号次级色
 - **深色模式**：底部"主题"下拉框三选项——浅色 / 深色 / 跟随系统（默认）。跟随系统模式下每 5 秒检测注册表 `AppsUseLightTheme`，系统切换即实时跟随；手动指定浅色/深色后不再受系统影响。切换时整套配色实时重刷，标题栏同步（DWM）
 - 内置汉仪文黑字体（`HYWenHei-65W.ttf`），通过 `AddFontResourceExW` 以进程私有方式加载，无需系统安装
 - 高 DPI 感知（`SetProcessDpiAwareness`）
@@ -43,10 +45,10 @@ Windows 桌面快捷方式管理器。以卡片形式管理 `.lnk` / `.exe` / `.
 
 `.url` 网页快捷方式：解析 INI 的 `IconFile=` / `IconIndex=` 字段（编码按 BOM → UTF-8 → 本机 ANSI 依次尝试）——指向图像文件（favicon 缓存的 .ico/.png 等）直接加载，指向 exe/dll 走 `ExtractIconEx`，兜底对 `.url` 本身走 shell 提取（通常得到默认浏览器图标）。目录路径走通用兜底链（`IShellItemImageFactory` / `SHGetFileInfoW`），得到资源管理器同款文件夹图标。
 
-**异步加载与缓存**：图标提取在后台 worker 线程执行，启动时卡片先显示占位图标再逐个回填，避免大量卡片阻塞 UI；提取结果以 `(路径, mtime)` 为键做内存 + 磁盘双层缓存（`icon_cache/` 目录存 PNG），重启后直接命中磁盘缓存、不重复提取。
+**异步加载与缓存**：图标提取在后台 worker 线程执行（任务队列只传纯数据，卡片经弱引用回填，关闭时哨兵退出），启动时卡片先显示占位图标再逐个回填；提取结果以 `(路径, mtime, 尺寸)` 为键做内存 LRU（512 张）+ 磁盘 PNG 双层缓存（`icon_cache/`），磁盘层超过 2000 个文件或 100MB 时后台按 mtime 淘汰。
 
 ### 状态持久化
-- 窗口尺寸/位置、字体、卡片宽度、文件夹结构（含锁定状态）、卡片顺序/描述/自定义标题/自定义图标/使用统计均保存到 `config.json`
+- 窗口尺寸/位置、字体、卡片宽度、文件夹结构（含锁定状态）、卡片顺序/描述/自定义标题/自定义图标/使用统计均保存到 `config.json`；各处变更经 400ms 防抖合并写盘，关闭窗口立即落盘
 - **原子写入**：先写 `.tmp` 并 fsync，再 `os.replace` 原子替换；旧版本轮转为 `config.json.bak`
 - **损坏恢复**：主文件解析失败时隔离为 `config.json.corrupt` 并尝试从 `.bak` 恢复，两者都不可用时弹窗让用户选择"重置继续"或"退出检查"
 - **双路径**：优先使用 exe 同目录的 `config.json`（Portable 语义）；目录不可写（如安装在 `Program Files`）时自动降级到 `%APPDATA%\QuickDeck\config.json`
@@ -143,12 +145,32 @@ build.bat
 
 ```
 QuickDeck/
-├── main.py            # 全部源码（约 2500 行）
-├── build.bat          # PyInstaller 打包脚本
-├── HYWenHei-65W.ttf   # 内置字体
-├── config.json        # 运行时生成的配置
-├── todo.md            # 开发过程的阶段性任务清单
-└── dist/QuickDeck.exe # 打包产物
+├── main.py                    # 入口壳（App 装配 / 视图路由 / 事件路由）
+├── quickdeck/                 # 分层源码包
+│   ├── constants.py           # 图标档位、字体等全局常量
+│   ├── platform/              # Win32 平台层
+│   │   ├── win32_icons.py     #   四通道图标提取兜底链（ctypes/COM）
+│   │   ├── win32_paint.py     #   防闪烁 PaintGuard（冻结/幕布/类刷子/深色标题栏）
+│   │   ├── dpi.py / fonts.py / system.py
+│   ├── services/              # 服务层
+│   │   ├── icon_cache.py      #   内存 LRU + 磁盘 PNG 缓存（带 GC）
+│   │   └── icon_loader.py     #   worker 线程异步提取（弱引用回填）
+│   ├── config/                # 配置层
+│   │   ├── schema.py          #   默认结构 / 合并 / 逐字段校验
+│   │   └── store.py           #   原子写 / bak 轮转 / 损坏恢复 / 双路径
+│   ├── model/workspace.py     # 纯数据层（Shortcut / Folder）
+│   └── ui/                    # 视图层
+│       ├── tokens.py          #   主题 token 表（唯一色源）
+│       ├── theme.py           #   注册制 ThemeManager
+│       ├── images.py          #   PIL 圆角卡片底图（LRU）
+│       ├── layout.py          #   列数计算 / 增量重排签名
+│       ├── dnd.py             #   拖拽控制器（幽灵卡 + 指示线）
+│       └── widgets/           #   卡片 / 文件夹框 / hover 工具
+├── tests/                     # 无头冒烟测试 + 程序化截图脚本
+├── build.bat                  # PyInstaller 打包脚本
+├── HYWenHei-65W.ttf           # 内置字体
+├── config.json                # 运行时生成的配置
+└── dist/QuickDeck.exe         # 打包产物
 ```
 
 ## 已知限制

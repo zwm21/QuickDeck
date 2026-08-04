@@ -10,17 +10,12 @@ QuickDeck —— Windows 桌面快捷方式管理器
 import os
 import sys
 import json
-import copy
 import time
 import uuid
-import queue
 import ctypes
-import hashlib
 import weakref
-import threading
-import subprocess
 import tkinter as tk
-from tkinter import ttk, font as tkFont, filedialog, messagebox, simpledialog
+from tkinter import ttk, font as tkFont, filedialog, messagebox
 
 # ---- 可选依赖：tkinterdnd2（文件拖放进窗口） --------------------
 # 缺失时程序正常运行，只是没有"从资源管理器拖文件进来"的能力。
@@ -49,17 +44,14 @@ from quickdeck.platform.dpi import enable_dpi_awareness
 from quickdeck.platform.system import system_prefers_light
 from quickdeck.platform.fonts import load_local_font
 from quickdeck.platform.win32_icons import (
-    resolve_shortcut, get_icon_for_file, get_title_for_file,
-    make_default_icon, _ensure_com, _init_win_apis, _iid, _com_release,
+    get_icon_for_file, make_default_icon, _ensure_com, _iid, _com_release,
 )
 # ---- 重构 P2：图标缓存/异步加载已拆分到 quickdeck.services ----
 from quickdeck.services.icon_cache import IconCache
 from quickdeck.services.icon_loader import IconLoader
 # ---- 重构 P3：配置层已拆分到 quickdeck.config ----
-from quickdeck.constants import (
-    ICON_SIZE, BUILTIN_FONT_FAMILY, icon_size_for,
-)
-from quickdeck.config.schema import DEFAULT_CONFIG, default_config
+from quickdeck.constants import BUILTIN_FONT_FAMILY, icon_size_for
+from quickdeck.config.schema import default_config
 from quickdeck.config.store import ConfigStore
 # ---- 重构 P4：数据层（widget 只作渲染，业务数据在纯数据类） ----
 from quickdeck.model.workspace import Shortcut, Folder

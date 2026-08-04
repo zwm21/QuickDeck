@@ -26,8 +26,6 @@ class ShortcutCard(tk.Frame):
     可拖拽（换顺序 / 跨文件夹）、可双击启动。
     """
 
-    # 兼容旧引用；实际生效值走 App.card_width（可由 UI 实时调整）
-    CARD_WIDTH = 500
 
     def __init__(self, master, app, item):
         """item: quickdeck.model.workspace.Shortcut——卡片的业务数据
