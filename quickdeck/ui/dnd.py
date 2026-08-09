@@ -17,6 +17,8 @@ mark_dirty / inner_frame。
 """
 import tkinter as tk
 
+from quickdeck.ui.widgets import tooltip
+
 DRAG_THRESHOLD = 8       # 超过该位移才认定为拖拽（防双击误触发幽灵）
 INDICATOR_WIDTH = 3      # 插入指示线宽度（px）
 
@@ -36,6 +38,7 @@ class DragController:
     # ================= 卡片拖拽 =================
     def card_start(self, card, event):
         app = self.app
+        tooltip.hide()
         # usage 视图只读；cards 视图只拖文件夹区卡片；web/dirs 只拖各自区
         if app.view_mode == "usage":
             return
@@ -134,6 +137,7 @@ class DragController:
 
     # ================= 文件夹拖拽 =================
     def folder_start(self, folder, event):
+        tooltip.hide()
         self.folder = folder
         self.card = None
         self._start_xy = (event.x_root, event.y_root)

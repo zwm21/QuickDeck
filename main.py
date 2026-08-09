@@ -64,6 +64,8 @@ from quickdeck.ui.layout import compute_cols
 from quickdeck.ui.dnd import DragController
 # ---- P8b：圆角底图 ----
 from quickdeck.ui import images as ui_images
+# ---- P10：描述气泡 ----
+from quickdeck.ui.widgets import tooltip
 from quickdeck.platform.win32_paint import PaintGuard
 
 
@@ -418,23 +420,26 @@ class App(_TK_BASE):
         th = self.theme
         self.configure(bg=th["app_bg"])
 
-        bottom = tk.Frame(self, bg=th["app_bg"])
-        bottom.pack(side="bottom", fill="x")
-        self.bottom_frame = bottom
+        # P10 底部单行：左侧工具栏按钮 + 竖分隔条 + 右侧设置控件
+        bar = tk.Frame(self, bg=th["app_bg"])
+        bar.pack(side="bottom", fill="x", padx=8, pady=(6, 8))
+        self.bottom_frame = bar
 
-        # 全局字体设置卡片
-        font_card = tk.Frame(bottom, bd=0, highlightthickness=1,
-                             highlightbackground=th["border"],
-                             highlightcolor=th["border"],
-                             padx=8, pady=6, bg=th["panel_bg"])
-        font_card.pack(side="bottom", fill="x", padx=8, pady=(0, 8))
-        self.font_card = font_card
+        # 按钮单独放在子 Frame 里：_update_toolbar_buttons 每次切视图都
+        # pack_forget 再重新 pack(side="left")，与设置控件同 Frame 会串位
+        toolbar = tk.Frame(bar, bg=th["app_bg"])
+        toolbar.pack(side="left")
+        self.toolbar = toolbar
+
+        sep = tk.Frame(bar, width=1, bg=th["border"])
+        sep.pack(side="left", fill="y", padx=10)
+        self.bottom_sep = sep
+
+        setbox = tk.Frame(bar, bg=th["app_bg"])
+        setbox.pack(side="left")
+        self.settings_frame = setbox
         self._panel_labels = []
 
-        lbl = tk.Label(font_card, text="全局字体：",
-                       font=self.app_font, bg=th["panel_bg"], fg=th["fg"])
-        lbl.pack(side="left")
-        self._panel_labels.append(lbl)
         self.font_family_var = tk.StringVar(value=self.app_font.cget("family"))
         families = sorted({f for f in tkFont.families() if f.strip()})
         for extra in (BUILTIN_FONT_FAMILY, self.app_font.cget("family")):
@@ -442,22 +447,22 @@ class App(_TK_BASE):
                 families.append(extra)
         families.sort()
         self.font_family_cb = ttk.Combobox(
-            font_card, textvariable=self.font_family_var,
-            values=families, width=26
+            setbox, textvariable=self.font_family_var,
+            values=families, width=14
         )
         self.font_family_cb.pack(side="left", padx=(4, 12))
         self.font_family_cb.bind("<<ComboboxSelected>>", self._on_font_change)
         self.font_family_cb.bind("<Return>", self._on_font_change)
         self.font_family_cb.bind("<FocusOut>", self._on_font_change)
 
-        lbl = tk.Label(font_card, text="字号：",
-                       font=self.app_font, bg=th["panel_bg"], fg=th["fg"])
+        lbl = tk.Label(setbox, text="字号",
+                       font=self.app_font, bg=th["app_bg"], fg=th["fg"])
         lbl.pack(side="left")
         self._panel_labels.append(lbl)
         self.font_size_var = tk.StringVar(
             value=str(int(self.app_font.cget("size"))))
         self.font_size_spin = tk.Spinbox(
-            font_card, from_=8, to=36, width=5,
+            setbox, from_=8, to=36, width=5,
             textvariable=self.font_size_var,
             font=self.app_font, command=self._on_font_change,
             bg=th["desc_bg"], fg=th["fg"], insertbackground=th["fg"],
@@ -468,8 +473,8 @@ class App(_TK_BASE):
         self.font_size_spin.bind("<FocusOut>", self._on_font_change)
 
         # 卡片宽度调节
-        lbl = tk.Label(font_card, text="卡片宽度：",
-                       font=self.app_font, bg=th["panel_bg"], fg=th["fg"])
+        lbl = tk.Label(setbox, text="卡宽",
+                       font=self.app_font, bg=th["app_bg"], fg=th["fg"])
         lbl.pack(side="left", padx=(12, 0))
         self._panel_labels.append(lbl)
         self.card_width_var = tk.StringVar(value=str(int(self.card_width)))
@@ -477,7 +482,7 @@ class App(_TK_BASE):
         # 这里保留 Spinbox 作为可键盘输入/单击的入口，但另外把两个自定义
         # 小箭头贴在旁边，用 ButtonPress/ButtonRelease + after 实现按住连续变化
         self.card_width_spin = tk.Spinbox(
-            font_card, from_=200, to=1200, width=6,
+            setbox, from_=200, to=1200, width=6,
             textvariable=self.card_width_var,
             font=self.app_font, command=self._on_card_width_change,
             increment=1,
@@ -493,7 +498,7 @@ class App(_TK_BASE):
         self._cw_repeat_after = None
         self._cw_repeat_dir = 0
         arrow_up = tk.Button(
-            font_card, text="\u25B2",  # ▲
+            setbox, text="\u25B2",  #▲
             font=self._make_small_font(), relief="flat", bd=1,
             padx=2, pady=0, width=2, takefocus=0,
             bg=th["btn_bg"], fg=th["fg"],
@@ -501,7 +506,7 @@ class App(_TK_BASE):
         )
         arrow_up.pack(side="left", padx=(2, 0))
         arrow_dn = tk.Button(
-            font_card, text="\u25BC",  # ▼
+            setbox, text="\u25BC",  #▼
             font=self._make_small_font(), relief="flat", bd=1,
             padx=2, pady=0, width=2, takefocus=0,
             bg=th["btn_bg"], fg=th["fg"],
@@ -519,11 +524,7 @@ class App(_TK_BASE):
         self.card_width_arrow_up = arrow_up
         self.card_width_arrow_dn = arrow_dn
 
-        # 主题模式选择（浅色 / 深色 / 跟随系统）
-        lbl = tk.Label(font_card, text="主题：",
-                       font=self.app_font, bg=th["panel_bg"], fg=th["fg"])
-        lbl.pack(side="left", padx=(12, 0))
-        self._panel_labels.append(lbl)
+        # 主题模式选择（浅色 / 深色 / 跟随系统）；下拉框自解释，不加标签
         self._THEME_MODE_LABELS = {
             "system": "跟随系统", "light": "浅色", "dark": "深色"}
         self._THEME_MODE_BY_LABEL = {
@@ -531,19 +532,15 @@ class App(_TK_BASE):
         self.theme_mode_var = tk.StringVar(
             value=self._THEME_MODE_LABELS.get(self.theme_mode, "跟随系统"))
         self.theme_mode_cb = ttk.Combobox(
-            font_card, textvariable=self.theme_mode_var,
+            setbox, textvariable=self.theme_mode_var,
             values=["跟随系统", "浅色", "深色"],
             state="readonly", width=8
         )
-        self.theme_mode_cb.pack(side="left", padx=(4, 0))
+        self.theme_mode_cb.pack(side="left", padx=(12, 0))
         self.theme_mode_cb.bind("<<ComboboxSelected>>",
                                 self._on_theme_mode_change)
 
         # 视图切换（卡片视图 / 按使用排序 / 网页快捷方式 / 文件夹快捷方式）
-        lbl = tk.Label(font_card, text="视图：",
-                       font=self.app_font, bg=th["panel_bg"], fg=th["fg"])
-        lbl.pack(side="left", padx=(12, 0))
-        self._panel_labels.append(lbl)
         self._VIEW_MODE_LABELS = {
             "cards": "卡片视图", "usage": "按使用排序",
             "web": "网页快捷方式", "dirs": "文件夹快捷方式"}
@@ -552,68 +549,63 @@ class App(_TK_BASE):
         self.view_mode_var = tk.StringVar(
             value=self._VIEW_MODE_LABELS["cards"])
         self.view_mode_cb = ttk.Combobox(
-            font_card, textvariable=self.view_mode_var,
+            setbox, textvariable=self.view_mode_var,
             values=["卡片视图", "按使用排序", "网页快捷方式", "文件夹快捷方式"],
             state="readonly", width=14
         )
-        self.view_mode_cb.pack(side="left", padx=(4, 0))
+        self.view_mode_cb.pack(side="left", padx=(8, 0))
         self.view_mode_cb.bind("<<ComboboxSelected>>",
                                self._on_view_mode_change)
 
-        # 工具栏
-        toolbar = tk.Frame(bottom, bg=th["app_bg"])
-        toolbar.pack(side="bottom", fill="x", padx=8, pady=(6, 0))
-        self.toolbar = toolbar
-
         self.add_btn = tk.Button(
-            toolbar, text="添加快捷方式",
+            toolbar, text="添加",
             font=self.app_font, command=self._on_add,
-            padx=12, pady=5, relief="flat", bd=0, cursor="hand2",
+            padx=10, pady=4, relief="flat", bd=0, cursor="hand2",
             bg=th["btn_bg"], fg=th["fg"],
             activebackground=th["btn_active_bg"], activeforeground=th["fg"]
         )
         self.add_btn.pack(side="left")
 
         self.multi_add_btn = tk.Button(
-            toolbar, text="多选添加快捷方式",
+            toolbar, text="多选添加",
             font=self.app_font, command=self._on_multi_add,
-            padx=12, pady=5, relief="flat", bd=0, cursor="hand2",
+            padx=10, pady=4, relief="flat", bd=0, cursor="hand2",
             bg=th["btn_bg"], fg=th["fg"],
             activebackground=th["btn_active_bg"], activeforeground=th["fg"]
         )
         self.multi_add_btn.pack(side="left", padx=(8, 0))
 
         self.new_folder_btn = tk.Button(
-            toolbar, text="新建文件夹",
+            toolbar, text="新建分组",
             font=self.app_font, command=self._on_new_folder,
-            padx=12, pady=5, relief="flat", bd=0, cursor="hand2",
+            padx=10, pady=4, relief="flat", bd=0, cursor="hand2",
             bg=th["btn_bg"], fg=th["fg"],
             activebackground=th["btn_active_bg"], activeforeground=th["fg"]
         )
         self.new_folder_btn.pack(side="left", padx=(8, 0))
 
         self.add_dir_btn = tk.Button(
-            toolbar, text="添加文件夹快捷方式",
+            toolbar, text="添加目录",
             font=self.app_font, command=self._on_add_dir,
-            padx=12, pady=5, relief="flat", bd=0, cursor="hand2",
+            padx=10, pady=4, relief="flat", bd=0, cursor="hand2",
             bg=th["btn_bg"], fg=th["fg"],
             activebackground=th["btn_active_bg"], activeforeground=th["fg"]
         )
         self.add_dir_btn.pack(side="left", padx=(8, 0))
 
         self.multi_add_dir_btn = tk.Button(
-            toolbar, text="多选添加文件夹快捷方式",
+            toolbar, text="多选目录",
             font=self.app_font, command=self._on_multi_add_dir,
-            padx=12, pady=5, relief="flat", bd=0, cursor="hand2",
+            padx=10, pady=4, relief="flat", bd=0, cursor="hand2",
             bg=th["btn_bg"], fg=th["fg"],
             activebackground=th["btn_active_bg"], activeforeground=th["fg"]
         )
         self.multi_add_dir_btn.pack(side="left", padx=(8, 0))
 
         self.open_dir_btn = tk.Button(
-            toolbar, text="打开程序目录",
+            toolbar, text="程序目录",
             font=self.app_font, command=self._on_open_app_dir,
-            padx=12, pady=5, relief="flat", bd=0, cursor="hand2",
+            padx=10, pady=4, relief="flat", bd=0, cursor="hand2",
             bg=th["btn_bg"], fg=th["fg"],
             activebackground=th["btn_active_bg"], activeforeground=th["fg"]
         )
@@ -669,9 +661,8 @@ class App(_TK_BASE):
         tm.register(self.inner_frame, bg="app_bg")
         tm.register(self.flat_view, bg="folder_bg")
         tm.register(self._flat_empty_label, bg="folder_bg", fg="fg")
-        tm.register(self.font_card, bg="panel_bg",
-                    highlightbackground="border", highlightcolor="border")
-
+        tm.register(self.settings_frame, bg="app_bg")
+        tm.register(self.bottom_sep, bg="border")
         # P8 hover：工具栏按钮 + 卡宽箭头
         from quickdeck.ui.widgets.hover import bind_hover
         for _b in (self.add_btn, self.multi_add_btn, self.new_folder_btn,
@@ -680,7 +671,7 @@ class App(_TK_BASE):
                    self.card_width_arrow_up, self.card_width_arrow_dn):
             bind_hover(self, _b, "btn_bg", "btn_hover_bg")
         for lbl in self._panel_labels:
-            tm.register(lbl, bg="panel_bg", fg="fg")
+            tm.register(lbl, bg="app_bg", fg="fg")
         for spin in (self.font_size_spin, self.card_width_spin):
             tm.register(spin, bg="desc_bg", fg="fg",
                         insertbackground="fg", buttonbackground="btn_bg")
@@ -883,6 +874,7 @@ class App(_TK_BASE):
            内部的 update_idletasks，整个切换只在末尾 flush 一次几何。
         经 _on_view_mode_change 进入时幕布/冻结已由外层挂好，此处的
         guard 因嵌套标志自动退化为 no-op。"""
+        tooltip.hide()
         with self.paint.guard():
             self._view_switch_batch = True
             try:
@@ -975,7 +967,7 @@ class App(_TK_BASE):
         for f in self.folders:
             f.invalidate_grid()
         for col in range(ncols):
-            self.flat_view.grid_columnconfigure(col, minsize=cw, weight=0)
+            self.flat_view.grid_columnconfigure(col, minsize=cw, weight=1)
         for col in range(ncols, ncols + 8):
             self.flat_view.grid_columnconfigure(col, minsize=0, weight=0)
         if not self._flat_cards:
@@ -983,10 +975,10 @@ class App(_TK_BASE):
                 text=self._FLAT_EMPTY_TEXT.get(
                     self.view_mode, self._FLAT_EMPTY_TEXT["usage"]))
             self._flat_empty_label.grid(row=0, column=0,
-                                        padx=4, pady=4, sticky="w")
+                                        padx=3, pady=3, sticky="w")
         for i, c in enumerate(self._flat_cards):
             c.grid(row=i // ncols, column=i % ncols, in_=self.flat_view,
-                   padx=4, pady=4, sticky="ew")
+                   padx=3, pady=3, sticky="ew")
             # 同 FolderFrame._reflow：防 stacking 覆盖
             try:
                 c.tkraise()
@@ -1057,6 +1049,7 @@ class App(_TK_BASE):
         self._update_scrollregion()
 
     def _on_mousewheel(self, event):
+        tooltip.hide()
         # 重构 P6 修复：旧实现 `if not self.folders: return` 会让
         # web/dirs 视图在没有任何文件夹时滚轮完全失效——可滚性只与
         # 当前 canvas 内容有关，交给下方 yview 判断

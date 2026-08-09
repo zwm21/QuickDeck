@@ -22,10 +22,10 @@ def check(name, cond):
     ok = ok and bool(cond)
 
 
-# ---- 1. compute_cols 边界 ----
-check("恰好一列", compute_cols(510, 500) == 1)
-check("差 1px 不到两列", compute_cols(1019, 500) == 1)
-check("恰好两列", compute_cols(1020, 500) == 2)
+# ---- 1. compute_cols 边界（gap=6：一列单元宽 506） ----
+check("恰好一列", compute_cols(506, 500) == 1)
+check("差 1px 不到两列", compute_cols(1011, 500) == 1)
+check("恰好两列", compute_cols(1012, 500) == 2)
 check("宽度 0 至少一列", compute_cols(0, 500) == 1)
 check("负宽至少一列", compute_cols(-100, 500) == 1)
 check("窄卡多列", compute_cols(700, 200) == 3)

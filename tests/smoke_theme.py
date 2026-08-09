@@ -38,14 +38,15 @@ def assert_theme(th, tag):
           and card._surface_state[3] == th["border_strong"])
     check(f"{tag}: card title fg",
           card.title_label.cget("fg") == th["fg"])
-    check(f"{tag}: desc entry bg",
-          card.desc_entry.cget("bg") == th["desc_bg"])
+    check(f"{tag}: 描述轨道 bg",
+          card.desc_rail.cget("bg") == th["border_strong"])
+    check(f"{tag}: 描述标记 bg",
+          card._desc_mark.cget("bg") == th["accent"])
     check(f"{tag}: folder bg", f.cget("bg") == th["folder_bg"])
     check(f"{tag}: header bg", f.header.cget("bg") == th["header_bg"])
     check(f"{tag}: 工具栏按钮 bg", app.add_btn.cget("bg") == th["btn_bg"])
-    # P8 起删除按钮常态用次级色，hover 才显危险色
-    check(f"{tag}: 删除按钮 fg",
-          card.del_btn.cget("fg") == th["fg_secondary"])
+    check(f"{tag}: 底部分隔条 bg",
+          app.bottom_sep.cget("bg") == th["border"])
 
 
 app.theme_mode = "dark"

@@ -16,6 +16,7 @@ from PIL import Image, ImageTk
 
 from quickdeck.constants import ICON_SIZE
 from quickdeck.ui.images import rounded_card_image
+from quickdeck.ui.widgets import tooltip
 from quickdeck.platform.win32_icons import (
     get_icon_for_file, get_title_for_file,
 )
@@ -33,7 +34,7 @@ class ShortcutCard(tk.Frame):
         th = app.theme
         # P8b 视觉：圆角卡片——Frame 本体用容器底色（四角外露），
         # 底层 Label 贴 PIL 预合成的圆角底图，子控件绘制在其上
-        super().__init__(master, bd=0, padx=10, pady=7,
+        super().__init__(master, bd=0, padx=10, pady=5,
                          bg=th["folder_bg"], highlightthickness=0)
         self._bg_label = tk.Label(self, bd=0, bg=th["folder_bg"])
         # bordermode="outside"：覆盖含内边距的整卡区域（默认 inside
@@ -67,6 +68,7 @@ class ShortcutCard(tk.Frame):
         self.icon_photo = ImageTk.PhotoImage(pil)
 
         self.icon_label = tk.Label(self, image=self.icon_photo,
+                                   bd=0, padx=0, pady=0,
                                    bg=th["card_bg"], cursor="fleur")
         self.icon_label.pack(side="left", padx=(0, 8))
 
@@ -76,38 +78,33 @@ class ShortcutCard(tk.Frame):
 
         title_text = self.custom_title or get_title_for_file(path)
         # P8 字号层级：标题加粗放大一号
+        # width=1：不让长标题把 reqwidth 撑出去（否则整列被拉宽、网格错位）；
+        # 按需求不加省略号，超长部分由卡片右边缘裁掉
         self.title_label = tk.Label(mid, text=title_text, anchor="w",
+                                    width=1, bd=0, padx=0, pady=0,
                                     font=app.font_title, bg=th["card_bg"],
                                     fg=th["fg"], cursor="fleur")
         self.title_label.pack(fill="x")
 
         self.desc_var = tk.StringVar(value=description)
-        # P8 字号层级：描述缩小一号 + 次级文字色
-        self.desc_entry = tk.Entry(mid, textvariable=self.desc_var,
-                                   font=app.font_desc, relief="flat",
-                                   bg=th["desc_bg"], fg=th["fg_secondary"],
-                                   insertbackground=th["fg"],
-                                   readonlybackground=th["desc_bg"])
-        self.desc_entry.pack(fill="x", pady=(3, 0))
-        self.desc_entry.bind("<FocusOut>", lambda e: self._sync_desc())
-        self.desc_entry.bind("<Return>", lambda e: self._sync_desc())
-
-        self.del_btn = tk.Button(self, text="\u2715",  # ✕（较 ❌ 更利落）
-                                 width=3, font=app.font_desc, relief="flat",
-                                 bd=0, cursor="hand2",
-                                 bg=th["card_bg"], fg=th["fg_secondary"],
-                                 activebackground=th["danger_active_bg"],
-                                 activeforeground=th["danger_fg"],
-                                 command=self._on_delete)
-        self.del_btn.pack(side="right", padx=(8, 0))
-        self.del_btn.bind("<Enter>", self._on_del_enter, add="+")
-        self.del_btn.bind("<Leave>", self._on_del_leave, add="+")
+        # P10：描述由可编辑 Entry 改为细轨道——空/非空等高，卡片高度统一。
+        # 有描述时左端填一小段强调色，悬停弹气泡显示全文；
+        # 编辑走右键菜单「编辑描述」
+        self.desc_rail = tk.Frame(mid, height=4, bg=th["border_strong"])
+        self.desc_rail.pack(fill="x", pady=(4, 0))
+        self.desc_rail.pack_propagate(False)
+        self._desc_mark = tk.Frame(self.desc_rail, bg=th["accent"])
+        for _w in (self.desc_rail, self._desc_mark):
+            _w.bind("<Enter>", self._on_rail_enter, add="+")
+            _w.bind("<Leave>", self._on_rail_leave, add="+")
+        self.refresh_desc()
 
         # P8 hover：整卡悬停高亮（进入子控件不算离开）
         self.bind("<Enter>", lambda e: self._set_hover(True), add="+")
         self.bind("<Leave>", self._on_pointer_leave, add="+")
         # P8b：尺寸变化时重生成圆角底图（含首次布局）
         self.bind("<Configure>", self._on_surface_configure, add="+")
+        self.bind("<Destroy>", lambda e: tooltip.hide(), add="+")
         # 底图 Label 沉底 + 与卡片同一套拖拽/双击/右键交互
         self._bg_label.lower()
         for _ev, _fn in (("<ButtonPress-1>", self._on_drag_start),
@@ -117,8 +114,9 @@ class ShortcutCard(tk.Frame):
                          ("<Button-3>", self._on_right_click)):
             self._bg_label.bind(_ev, _fn)
 
-        # 拖拽 & 双击（不绑 Entry / 删除按钮，避免影响文本编辑与点击）
-        for w in (self, mid, self.icon_label, self.title_label):
+        # 拖拽 & 双击（整卡任意位置都可拖，含描述轨道）
+        for w in (self, mid, self.icon_label, self.title_label,
+                  self.desc_rail, self._desc_mark):
             w.bind("<ButtonPress-1>", self._on_drag_start)
             w.bind("<B1-Motion>", self._on_drag_motion)
             w.bind("<ButtonRelease-1>", self._on_drag_end)
@@ -133,11 +131,8 @@ class ShortcutCard(tk.Frame):
         tm.register(self.icon_label, bg="card_bg")
         tm.register(mid, bg="card_bg")
         tm.register(self.title_label, bg="card_bg", fg="fg")
-        tm.register(self.desc_entry, bg="desc_bg", fg="fg_secondary",
-                    insertbackground="fg", readonlybackground="desc_bg")
-        tm.register(self.del_btn, bg="card_bg", fg="fg_secondary",
-                    activebackground="danger_active_bg",
-                    activeforeground="danger_fg")
+        tm.register(self.desc_rail, bg="border_strong")
+        tm.register(self._desc_mark, bg="accent")
 
         # widget 就绪后再入队异步提取（结果经主线程轮询回填）
         if pending_async:
@@ -166,7 +161,7 @@ class ShortcutCard(tk.Frame):
         else:
             fill, outline = th["card_bg"], th["border_strong"]
         try:
-            photo = rounded_card_image(w, h, 8, fill, outline,
+            photo = rounded_card_image(w, h, 6, fill, outline,
                                        th["folder_bg"])
             self._bg_label.configure(image=photo, bg=th["folder_bg"])
             self._bg_photo = photo  # 持引用防被 GC
@@ -181,7 +176,6 @@ class ShortcutCard(tk.Frame):
         try:
             for w in (self.icon_label, self.mid, self.title_label):
                 w.configure(bg=bg)
-            self.del_btn.configure(bg=bg)
         except tk.TclError:
             pass
         if self._flash_job is None:
@@ -200,21 +194,31 @@ class ShortcutCard(tk.Frame):
             pass
         self._set_hover(False)
 
-    def _on_del_enter(self, _e):
-        th = self.app.theme
-        try:
-            self.del_btn.configure(bg=th["danger_hover_bg"],
-                                   fg=th["danger_fg"])
-        except tk.TclError:
-            pass
+    # ---- 描述轨道（P10） ----
+    def refresh_desc(self):
+        """按描述有无切换轨道左端的强调色标记。"""
+        if self.desc_var.get().strip():
+            self._desc_mark.place(x=0, y=0, relheight=1, width=28)
+        else:
+            self._desc_mark.place_forget()
 
-    def _on_del_leave(self, _e):
-        th = self.app.theme
-        bg = th["card_hover_bg"] if self._hovered else th["card_bg"]
+    def _on_rail_enter(self, _e):
+        text = self.desc_var.get().strip()
+        if text:
+            tooltip.show(self.app, self.desc_rail, text)
+
+    def _on_rail_leave(self, _e):
+        """指针在轨道与其内部标记之间移动也会触发 Leave，
+        仍在轨道矩形内则保留气泡（同 _on_pointer_leave 的思路）。"""
         try:
-            self.del_btn.configure(bg=bg, fg=th["fg_secondary"])
+            x, y = self.winfo_pointerxy()
+            rx, ry = self.desc_rail.winfo_rootx(), self.desc_rail.winfo_rooty()
+            if (rx <= x < rx + self.desc_rail.winfo_width()
+                    and ry <= y < ry + self.desc_rail.winfo_height()):
+                return
         except tk.TclError:
             pass
+        tooltip.hide()
 
     def flash_launch(self):
         """双击启动成功的视觉确认：圆角描边闪两下 accent 色。"""
@@ -445,7 +449,8 @@ class ShortcutCard(tk.Frame):
         if new is None:
             return
         self.desc_var.set(new)
-        self.app.mark_dirty()
+        self._sync_desc()
+        self.refresh_desc()
 
     def _menu_open_location(self):
         """在资源管理器中打开文件所在位置并选中该文件。"""
@@ -498,20 +503,8 @@ class ShortcutCard(tk.Frame):
 
     # ---- 锁定状态可视化 ----
     def apply_lock_state(self, locked):
-        """描述框改为只读、删除按钮禁用；双击/拖拽通过绑定内 flag 已拦截。"""
-        state = "disabled" if locked else "normal"
-        try:
-            # Entry 用 readonly 可以保留内容可见，disabled 会变灰但也可
-            self.desc_entry.configure(
-                state="readonly" if locked else "normal"
-            )
-        except Exception:
-            pass
-        try:
-            self.del_btn.configure(state=state)
-        except Exception:
-            pass
-        # 光标反馈：拖拽把手/图标/标题不再显示 fleur 移动光标
+        """锁定时只改光标；拖拽/删除的拦截分别由 _on_drag_* 内的 flag
+        与右键菜单项 state 完成。"""
         cursor = "arrow" if locked else "fleur"
         for w in (self, self.icon_label, self.title_label):
             try:

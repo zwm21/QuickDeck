@@ -13,7 +13,7 @@ from quickdeck.constants import BUILTIN_FONT_FAMILY
 DEFAULT_CONFIG = {
     "window": {"width": 900, "height": 650, "x": 200, "y": 100},
     "font": {"family": BUILTIN_FONT_FAMILY, "size": 12},
-    "card_width": 500,
+    "card_width": 320,
     "theme_mode": "system",  # "system" | "light" | "dark"
     "shortcuts": [],
     # 网页快捷方式独立存储区（.url 不进文件夹，在"网页快捷方式"视图中管理）

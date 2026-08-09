@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """布局纯函数（无 tk 依赖，可单测）。"""
 
-CARD_GAP = 10  # 每列宽度余量（卡片间 padding）
+CARD_GAP = 6  # 每列宽度余量：等于卡片 grid padx 两侧之和
 
 
 def compute_cols(avail_width, card_width, gap=CARD_GAP):

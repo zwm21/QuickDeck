@@ -33,7 +33,7 @@ class FolderFrame(tk.Frame):
         self._last_grid_sig = None  # 增量重排签名（重构 P6）
 
         # ---- header（紧凑：小 padding，无冗余空间） ----
-        header = tk.Frame(self, bg=th["header_bg"], padx=4, pady=1)
+        header = tk.Frame(self, bg=th["header_bg"], padx=4, pady=0)
         header.pack(fill="x")
         self.header = header
 
@@ -380,14 +380,14 @@ class FolderFrame(tk.Frame):
             except Exception:
                 pass
         for col in range(self._num_cols):
-            self.body.grid_columnconfigure(col, minsize=cw, weight=0)
+            self.body.grid_columnconfigure(col, minsize=cw, weight=1)
         # 收敛：清掉多余列的最小宽度配置
         for col in range(self._num_cols, self._num_cols + 8):
             self.body.grid_columnconfigure(col, minsize=0, weight=0)
         for i, c in enumerate(self.cards):
             r, col = i // self._num_cols, i % self._num_cols
             c.grid(row=r, column=col, in_=self.body,
-                   padx=4, pady=4, sticky="ew")
+                   padx=3, pady=3, sticky="ew")
             # tkinter 的 -in 参数只改显示位置，不改 stacking order。
             # card 的 tk parent 是 App.inner_frame，folder 也是。stacking
             # 顺序按创建时间：老 folder < 老 card < 新 folder < ...。
