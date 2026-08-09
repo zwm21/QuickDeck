@@ -59,7 +59,7 @@ from quickdeck.model.workspace import Shortcut, Folder
 from quickdeck.ui.tokens import LIGHT_THEME, DARK_THEME
 from quickdeck.ui.theme import ThemeManager
 # ---- 重构 P6：布局纯函数 ----
-from quickdeck.ui.layout import compute_cols
+from quickdeck.ui.layout import CARD_GAP, compute_cols
 # ---- 重构 P7：拖拽控制器 ----
 from quickdeck.ui.dnd import DragController
 # ---- P8b：圆角底图 ----
@@ -966,8 +966,10 @@ class App(_TK_BASE):
         # 平铺视图把文件夹区卡片 grid_forget 了，回卡片视图时需全量重排
         for f in self.folders:
             f.invalidate_grid()
+        # 同 FolderFrame._reflow：列宽恒定、余量留白在右侧
         for col in range(ncols):
-            self.flat_view.grid_columnconfigure(col, minsize=cw, weight=1)
+            self.flat_view.grid_columnconfigure(col, minsize=cw + CARD_GAP,
+                                                weight=0)
         for col in range(ncols, ncols + 8):
             self.flat_view.grid_columnconfigure(col, minsize=0, weight=0)
         if not self._flat_cards:

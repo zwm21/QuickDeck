@@ -7,7 +7,7 @@
 import tkinter as tk
 from tkinter import font as tkFont
 
-from quickdeck.ui.layout import compute_cols, grid_signature
+from quickdeck.ui.layout import CARD_GAP, compute_cols, grid_signature
 
 
 class FolderFrame(tk.Frame):
@@ -379,8 +379,12 @@ class FolderFrame(tk.Frame):
                 c.pack_forget()
             except Exception:
                 pass
+        # 列宽恒为 cw + CARD_GAP（= 卡片墨迹宽 + padx 两侧），weight=0：
+        # 卡宽只由卡宽控件决定，窗口变宽只增列数、余量留白在右侧。
+        # 用过 weight=1 铺满整行，副作用是卡片被拉伸、卡宽控件失效。
         for col in range(self._num_cols):
-            self.body.grid_columnconfigure(col, minsize=cw, weight=1)
+            self.body.grid_columnconfigure(col, minsize=cw + CARD_GAP,
+                                           weight=0)
         # 收敛：清掉多余列的最小宽度配置
         for col in range(self._num_cols, self._num_cols + 8):
             self.body.grid_columnconfigure(col, minsize=0, weight=0)

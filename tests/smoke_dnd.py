@@ -35,10 +35,25 @@ app.update()  # 需要真实几何坐标，不 withdraw
 
 dnd = app.dnd
 
-# 找两个未锁定且有卡片的文件夹
-src = next(f for f in app.folders if f.cards and not f.locked)
-dst = next(f for f in app.folders
-           if f is not src and not f.locked and not f.collapsed)
+# 找两个未锁定且有卡片的文件夹。拖拽机制与锁定无关，而用户真实配置
+# 里可能所有有卡片的分组都上了锁——就地解锁/展开来备好前置状态
+# （save_config 已被打掉，不会写回用户配置）。
+def _prepare(exclude=None):
+    for f in app.folders:
+        if f is exclude or not f.cards:
+            continue
+        if f.locked:
+            f.set_locked(False)
+        if f.collapsed:
+            f.set_collapsed(False)
+        return f
+    return None
+
+
+src = _prepare()
+dst = _prepare(exclude=src)
+assert src is not None and dst is not None, "需要两个有卡片的文件夹"
+app.update()
 card = src.cards[0]
 cx = card.winfo_rootx() + 10
 cy = card.winfo_rooty() + 10
