@@ -56,20 +56,27 @@ def assert_theme(th, tag):
     for w, wl in ((f.drag_handle, "把手"), (f.lock_btn, "锁"),
                   (f.collapse_btn, "折叠"), (f.del_btn, "删除")):
         check(f"{tag}: {wl}按钮字体", w.cget("font") == icon_font.name)
-    # P12：三按钮常驻色块
-    check(f"{tag}: 锁按钮 bg/fg", f.lock_btn.cget("bg") == th["lock_bg"]
+    # P13：三按钮常驻色块——底色随锁定态压平/恢复，断言按状态算期望
+    flat = f.locked
+    check(f"{tag}: 锁按钮 bg/fg",
+          f.lock_btn.cget("bg")
+          == (th["header_bg"] if flat else th["lock_bg"])
           and f.lock_btn.cget("fg") == th["lock_fg"]
-          and f.lock_btn.cget("activebackground") == th["lock_bg_active"]
+          and f.lock_btn.cget("activebackground")
+          == (th["header_active_bg"] if flat else th["lock_bg_active"])
           and f.lock_btn.cget("activeforeground") == th["lock_fg"])
-    check(f"{tag}: 折叠按钮 bg/fg", f.collapse_btn.cget("bg") == th["accent_bg"]
-          and f.collapse_btn.cget("fg") == th["accent"]
+    check(f"{tag}: 折叠按钮 bg/fg",
+          f.collapse_btn.cget("bg")
+          == (th["header_bg"] if flat else th["collapse_bg"])
+          and f.collapse_btn.cget("fg")
+          == (th["fg_secondary"] if flat else th["collapse_fg"])
           and f.collapse_btn.cget("activebackground")
-          == th["accent_bg_active"]
+          == (th["header_active_bg"] if flat
+              else th["collapse_bg_active"])
           and f.collapse_btn.cget("activeforeground")
-          == th["accent_hover"])
+          == (th["fg_secondary"] if flat else th["collapse_fg"]))
     check(f"{tag}: 折叠按钮 ▼", f.collapse_btn.cget("text") == "\u25BC")
-    # 删除按钮底色随锁定态：锁定灰底 / 解锁浅红底
-    del_bg_exp = th["header_bg"] if f.locked else th["danger_bg"]
+    del_bg_exp = th["header_bg"] if flat else th["danger_bg"]
     check(f"{tag}: 删除按钮 bg/fg", f.del_btn.cget("bg") == del_bg_exp
           and f.del_btn.cget("fg") == th["danger_fg"]
           and f.del_btn.cget("activeforeground") == th["danger_fg"]
@@ -104,7 +111,7 @@ if victim is not None:
     app.update()
     check("再次切换注册数稳定", app.tm.count() == n_after)
 
-# P12：锁定/折叠状态视觉（在真实 folders[0] 上做，先存后恢复）
+# P13：锁定/折叠状态矩阵（在真实 folders[0] 上做，先存后恢复）
 _f = app.folders[0]
 _old_locked, _old_collapsed = _f.locked, _f.collapsed
 try:
@@ -112,21 +119,37 @@ try:
     app.update()
     check("锁定: 删除按钮 disabled",
           str(_f.del_btn.cget("state")) == "disabled")
-    check("锁定: 删除按钮灰底", _f.del_btn.cget("bg") == L["header_bg"])
+    check("锁定: 三按钮全部压平灰底",
+          _f.del_btn.cget("bg") == L["header_bg"]
+          and _f.collapse_btn.cget("bg") == L["header_bg"]
+          and _f.lock_btn.cget("bg") == L["header_bg"])
+    check("锁定: 三按钮 active 档退中性",
+          _f.collapse_btn.cget("activebackground")
+          == L["header_active_bg"]
+          and _f.lock_btn.cget("activebackground")
+          == L["header_active_bg"])
+    check("锁定: 折叠 fg 退次级灰",
+          _f.collapse_btn.cget("fg") == L["fg_secondary"])
     check("锁定: 锁图标 🔒", _f.lock_btn.cget("text") == "\U0001F512")
     check("锁定: 名字 readonly",
           str(_f.name_entry.cget("state")) == "readonly")
-    # 切深色：注册表刷新后钩子应保持灰底，而非刷回常驻红底
+    # 切深色：注册表刷新后钩子应保持压平，而非刷回语义色块
     app.apply_theme(D)
     app.update()
-    check("切深色: 锁定删除按钮仍灰底",
-          _f.del_btn.cget("bg") == D["header_bg"])
+    check("切深色: 锁定三按钮仍压平",
+          _f.del_btn.cget("bg") == D["header_bg"]
+          and _f.collapse_btn.cget("bg") == D["header_bg"]
+          and _f.lock_btn.cget("bg") == D["header_bg"])
     check("切深色: 删除按钮 fg 常驻红",
           _f.del_btn.cget("fg") == D["danger_fg"])
     _f.set_locked(False)
     app.update()
-    check("解锁: 删除按钮恢复红底",
-          _f.del_btn.cget("bg") == D["danger_bg"])
+    check("解锁: 三按钮恢复语义色块",
+          _f.del_btn.cget("bg") == D["danger_bg"]
+          and _f.collapse_btn.cget("bg") == D["collapse_bg"]
+          and _f.lock_btn.cget("bg") == D["lock_bg"])
+    check("解锁: 折叠 fg 回绿",
+          _f.collapse_btn.cget("fg") == D["collapse_fg"])
     check("解锁: 锁图标 🔓", _f.lock_btn.cget("text") == "\U0001F513")
     _f.set_collapsed(True)
     app.update()
