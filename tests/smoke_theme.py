@@ -7,6 +7,9 @@ import sys
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(TESTS_DIR))
 
+import tkinter as tk  # noqa: E402
+from tkinter import font as tkFont  # noqa: E402
+
 import main  # noqa: E402
 
 ok = True
@@ -47,15 +50,30 @@ def assert_theme(th, tag):
     check(f"{tag}: 工具栏按钮 bg", app.add_btn.cget("bg") == th["btn_bg"])
     check(f"{tag}: 底部分隔条 bg",
           app.bottom_sep.cget("bg") == th["border"])
-    # P12：header 图标按钮——字体统一 Segoe UI Symbol / 应用字号
+    # P12/P15：header 图标按钮——字体统一 Segoe UI Symbol / 应用字号-2
     icon_font = f._icon_font
     check(f"{tag}: 图标字体族", icon_font.actual("family") == "Segoe UI Symbol")
     check(f"{tag}: 图标字体字号",
           icon_font.actual("size")
-          == max(8, int(app.app_font.cget("size"))))
+          == max(8, int(app.app_font.cget("size")) - 2))
     for w, wl in ((f.drag_handle, "把手"), (f.lock_btn, "锁"),
                   (f.collapse_btn, "折叠"), (f.del_btn, "删除")):
         check(f"{tag}: {wl}按钮字体", w.cget("font") == icon_font.name)
+    # P14：图标按钮高度不超过改前基准（同族字体 N-1 的探针按钮）
+    probe = tk.Button(
+        app, text="x", relief="flat", bd=0, pady=0,
+        font=tkFont.Font(family=app.app_font.cget("family"),
+                         size=max(8, int(app.app_font.cget("size")) - 1)))
+    probe.update_idletasks()
+    base_h = probe.winfo_reqheight()
+    probe.destroy()
+    check(f"{tag}: 按钮高度<=改前基准+2",
+          all(w.winfo_reqheight() <= base_h + 2 for w in
+              (f.lock_btn, f.collapse_btn, f.del_btn)))
+    # P15：三按钮容器为正方形（读配置值，withdraw 窗口下成立）
+    check(f"{tag}: 三按钮容器正方形",
+          all(h.cget("width") == h.cget("height") and int(h.cget("width")) > 0
+              for h in (f.lock_holder, f.collapse_holder, f.del_holder)))
     # P13：三按钮常驻色块——底色随锁定态压平/恢复，断言按状态算期望
     flat = f.locked
     check(f"{tag}: 锁按钮 bg/fg",
