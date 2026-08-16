@@ -5,24 +5,20 @@
 文件夹内，跨文件夹移动不销毁重建（不重复提取图标）。
 """
 import tkinter as tk
-from tkinter import font as tkFont
 
 from quickdeck.ui.layout import CARD_GAP, compute_cols, grid_signature
 
-# P12：header 图形字符统一走模块常量。HYWenHei 缺这些码位
-# （fontTools cmap 实测），靠系统字体逐字符回退渲染会导致各按钮
-# 大小/字重不一；▾/▸ 是 Unicode "small" 变体（16px 下墨迹仅 6×6），
-# 换全尺寸 ▼/▶ 后与 ✖ 同量级。
+# P12：header 图形字符统一走模块常量。HYWenHei 缺其中五个码位、
+# 仅含 ▼（fontTools cmap 实测），靠系统字体逐字符回退渲染会导致各
+# 按钮大小/字重不一；▾/▸ 是 Unicode "small" 变体（16px 下墨迹仅 6×6），
+# 换全尺寸 ▼/▶ 后与 ✖ 同量级。字形所在的图标字体族/字号公式定义在
+# quickdeck.constants（ICON_FONT_FAMILY / icon_font_size_for）。
 ICON_DRAG = "\u2630"            # ☰ 拖拽把手
 ICON_LOCK_OPEN = "\U0001F513"   # 🔓 未锁
 ICON_LOCK_CLOSED = "\U0001F512"  # 🔒 已锁
 ICON_COLLAPSE_OPEN = "\u25BC"   # ▼ 展开中，点击收起
 ICON_COLLAPSE_CLOSED = "\u25B6"  # ▶ 已收起，点击展开
 ICON_DELETE = "\u2716"          # ✖ 删除
-
-# 图标按钮专用字体族：Segoe UI Symbol 覆盖上面全部码位（cmap 实测）。
-# 族不跟随用户字体（换任意字体族都不会丢字形），只字号跟随应用字号。
-ICON_FONT_FAMILY = "Segoe UI Symbol"
 
 
 class FolderFrame(tk.Frame):
@@ -52,20 +48,15 @@ class FolderFrame(tk.Frame):
         header.pack(fill="x")
         self.header = header
 
-        # P12：图标按钮/把手统一 ICON_FONT_FAMILY（见模块头注释）。
-        # P14：字号取应用字号-2——Segoe UI Symbol 行高比 HYWenHei 高
-        # 一档，-2 才能把按钮高度复原到 P12 前水平（chrome 非线性，
-        # 此值经全字号实测校准）；header 高度由 name_entry 决定
-        self._icon_font = tkFont.Font(
-            family=ICON_FONT_FAMILY,
-            size=max(8, int(app.app_font.cget("size")) - 2)
-        )
-        # P8 字号层级：文件夹名加粗（保持紧凑字号）
-        self._name_font = tkFont.Font(
-            family=app.app_font.cget("family"),
-            size=max(8, int(app.app_font.cget("size"))),
-            weight="bold"
-        )
+        # P12/P16：图标按钮/把手统一走 App 级共享图标字体（族恒为
+        # Segoe UI Symbol，见 constants.ICON_FONT_FAMILY）；P14 字号
+        # 取应用字号-2（constants.icon_font_size_for）——Segoe UI
+        # Symbol 行高比 HYWenHei 高一档，-2 才能把按钮高度复原到
+        # P12 前水平（chrome 非线性，此值经全字号实测校准）；
+        # header 高度由 name_entry 决定
+        self._icon_font = app.folder_icon_font
+        # P8 字号层级：文件夹名加粗（保持紧凑字号），同为 App 级共享
+        self._name_font = app.folder_name_font
 
         self.drag_handle = tk.Label(
             header, text=ICON_DRAG, font=self._icon_font,
@@ -199,9 +190,13 @@ class FolderFrame(tk.Frame):
     def _sync_square_buttons(self):
         """P15：三个图标按钮容器设为正方形。tk.Button 的 width 是
         字符单位无法定像素，像素级正方形只能由固定尺寸容器 +
-        fill 填充实现。边长取按钮自然高度（字体驱动，字号/DPI
-        变化自动跟随）；防御：字形自然宽超自然高时取 max，
-        退化为非正方形也不裁字。"""
+        fill 填充实现。边长取按钮自然高度（字体驱动）；防御：字形
+        自然宽超自然高时取 max，退化为非正方形也不裁字。
+
+        测量时序契约（P16）：命名字体被 configure 后，控件请求尺寸
+        要到空闲刷新（<<Changed>> 事件机制）才重算——运行期改字号
+        的调用方必须先结清 update_idletasks 再调这里，否则读到旧值
+        （控件创建路径同步计算，无需结清）。"""
         for holder, btn in ((self.lock_holder, self.lock_btn),
                             (self.collapse_holder, self.collapse_btn),
                             (self.del_holder, self.del_btn)):
@@ -211,7 +206,14 @@ class FolderFrame(tk.Frame):
             except Exception:
                 pass
 
-    # ---- 数据转发（重构 P4：元数据唯一真源是 self.meta） ----
+    def refresh_header_font(self):
+        """app 字体变化后同步 header 几何（P16）。
+
+        header 两种字体是 App 级共享对象，已由 App._apply_font_now
+        单点 configure，且调用方在调这里之前已结清空闲几何重算——
+        本方法只负责按新字体度量重设正方形按钮边长。"""
+        self._sync_square_buttons()
+
     @property
     def id(self):
         return self.meta.id
@@ -239,19 +241,6 @@ class FolderFrame(tk.Frame):
     @collapsed.setter
     def collapsed(self, v):
         self.meta.collapsed = bool(v)
-
-    def refresh_header_font(self):
-        """app 字体变化时，让 header 内部字体跟着刷新。
-        图标字体族恒为 Segoe UI Symbol，只同步字号（P14：N-2）。"""
-        try:
-            self._name_font.configure(
-                family=self.app.app_font.cget("family"),
-                size=max(8, int(self.app.app_font.cget("size"))))
-            self._icon_font.configure(
-                size=max(8, int(self.app.app_font.cget("size")) - 2))
-        except Exception:
-            pass
-        self._sync_square_buttons()
 
     # ---- 事件 ----
     def _on_rename(self):

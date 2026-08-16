@@ -50,7 +50,8 @@ from quickdeck.platform.win32_icons import (
 from quickdeck.services.icon_cache import IconCache
 from quickdeck.services.icon_loader import IconLoader
 # ---- 重构 P3：配置层已拆分到 quickdeck.config ----
-from quickdeck.constants import BUILTIN_FONT_FAMILY, icon_size_for
+from quickdeck.constants import (BUILTIN_FONT_FAMILY, ICON_FONT_FAMILY,
+                                 icon_font_size_for, icon_size_for)
 from quickdeck.config.schema import default_config
 from quickdeck.config.store import ConfigStore
 # ---- 重构 P4：数据层（widget 只作渲染，业务数据在纯数据类） ----
@@ -244,6 +245,14 @@ class App(_TK_BASE):
         self.font_title = tkFont.Font(family=_fam, size=_size + 1,
                                       weight="bold")
         self.font_desc = tkFont.Font(family=_fam, size=max(8, _size - 1))
+        # P16：文件夹 header 共享字体——所有 folder 参数恒同，此前每
+        # 个 FolderFrame 各建 2 个命名字体（删除 folder 不回收，长会话
+        # 慢性泄漏；调字号还要逐 folder 重复 configure）。收口为 App 级
+        # 单实例，FolderFrame 经 app.folder_*_font 直接引用
+        self.folder_icon_font = tkFont.Font(
+            family=ICON_FONT_FAMILY, size=icon_font_size_for(_size))
+        self.folder_name_font = tkFont.Font(family=_fam, size=max(8, _size),
+                                            weight="bold")
         # 卡片宽度（运行时可调，实时影响所有 folder 的 grid 列宽）
         try:
             self.card_width = int(self.cfg.get("card_width", 500))
@@ -1593,8 +1602,17 @@ class App(_TK_BASE):
         # 层级字体跟随（P8）
         self.font_title.configure(family=family, size=size + 1)
         self.font_desc.configure(family=family, size=max(8, size - 1))
+        # header 共享字体跟随（P16）：单点 configure；图标字体族恒为
+        # Segoe UI Symbol 只跟字号（N-2 公式见 constants.ICON_FONT_DELTA）
+        self.folder_icon_font.configure(size=icon_font_size_for(size))
+        self.folder_name_font.configure(family=family, size=max(8, size))
         self._apply_style_font()
-        # 字体变化时同步刷新 folder header 用的小号字
+        # 命名字体 configure 后，控件的请求尺寸要到空闲刷新才重算
+        # （<<Changed>> 事件机制）——必须先结清再让 folder 测量正方形
+        # 边长，否则读到旧值（审查期真机复现：字号 11→17，holder
+        # 仍是 27px 而按钮需求 50px，字形被固定容器裁切）
+        self.update_idletasks()
+        # 字体变化时同步刷新各 folder header 的正方形按钮边长
         for f in self.folders:
             try:
                 f.refresh_header_font()

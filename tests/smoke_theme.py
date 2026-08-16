@@ -11,6 +11,7 @@ import tkinter as tk  # noqa: E402
 from tkinter import font as tkFont  # noqa: E402
 
 import main  # noqa: E402
+from quickdeck.constants import icon_font_size_for  # noqa: E402
 
 ok = True
 
@@ -50,12 +51,16 @@ def assert_theme(th, tag):
     check(f"{tag}: 工具栏按钮 bg", app.add_btn.cget("bg") == th["btn_bg"])
     check(f"{tag}: 底部分隔条 bg",
           app.bottom_sep.cget("bg") == th["border"])
-    # P12/P15：header 图标按钮——字体统一 Segoe UI Symbol / 应用字号-2
+    # P12/P15/P16：header 图标按钮——App 级共享字体（Segoe UI
+    # Symbol），字号走 constants.icon_font_size_for 公式（N-2）
     icon_font = f._icon_font
     check(f"{tag}: 图标字体族", icon_font.actual("family") == "Segoe UI Symbol")
     check(f"{tag}: 图标字体字号",
           icon_font.actual("size")
-          == max(8, int(app.app_font.cget("size")) - 2))
+          == icon_font_size_for(int(app.app_font.cget("size"))))
+    check(f"{tag}: header 字体 App 级共享",
+          f._icon_font is app.folder_icon_font
+          and f._name_font is app.folder_name_font)
     for w, wl in ((f.drag_handle, "把手"), (f.lock_btn, "锁"),
                   (f.collapse_btn, "折叠"), (f.del_btn, "删除")):
         check(f"{tag}: {wl}按钮字体", w.cget("font") == icon_font.name)
@@ -70,9 +75,14 @@ def assert_theme(th, tag):
     check(f"{tag}: 按钮高度<=改前基准+2",
           all(w.winfo_reqheight() <= base_h + 2 for w in
               (f.lock_btn, f.collapse_btn, f.del_btn)))
-    # P15：三按钮容器为正方形（读配置值，withdraw 窗口下成立）
+    # P15：三按钮容器为正方形（读配置值，withdraw 窗口下成立），
+    # 且边长不低于字体行高（防退化成 1px 假正方形）
+    line_h = icon_font.metrics("linespace")
     check(f"{tag}: 三按钮容器正方形",
           all(h.cget("width") == h.cget("height") and int(h.cget("width")) > 0
+              for h in (f.lock_holder, f.collapse_holder, f.del_holder)))
+    check(f"{tag}: 正方形边长下界(>=字体行高)",
+          all(int(h.cget("width")) >= line_h
               for h in (f.lock_holder, f.collapse_holder, f.del_holder)))
     # P13：三按钮常驻色块——底色随锁定态压平/恢复，断言按状态算期望
     flat = f.locked
@@ -180,6 +190,64 @@ try:
 finally:
     _f.set_locked(_old_locked)
     _f.set_collapsed(_old_collapsed)
+
+# P16：字号跟随——运行时走真实路径（字号控件 -> _apply_font_now），
+# 正方形边长必须立即跟到新字体度量（审查期 bug：旧实现读到过期值，
+# holder 27px 装不下 50px 按钮需求，字形被裁）
+_ff = app.folders[0]
+_old_sz = int(app.app_font.cget("size"))
+_new_sz = 29 if _old_sz < 21 else 11  # 拉开差距，确保边长必然变化
+_side_before = int(_ff.lock_holder.cget("height"))
+app.font_size_var.set(str(_new_sz))
+app._apply_font_now()
+app.update_idletasks()
+check("字号跟随: 边长已变化", int(_ff.lock_holder.cget("height")) != _side_before)
+check("字号跟随: 边长==按钮自然高度(无裁切)",
+      all(int(h.cget("height")) == b.winfo_reqheight()
+          for h, b in ((_ff.lock_holder, _ff.lock_btn),
+                       (_ff.collapse_holder, _ff.collapse_btn),
+                       (_ff.del_holder, _ff.del_btn))))
+check("字号跟随: 共享图标字体已单点更新",
+      app.folder_icon_font.actual("size") == icon_font_size_for(_new_sz))
+app.font_size_var.set(str(_old_sz))
+app._apply_font_now()
+app.update_idletasks()
+
+# P16：hover 动态 token 解析——_resolve 单测 + 离屏可见窗口 E2E
+#（withdraw 下 event_generate 实测不派发；离屏 deiconify 可派发）
+from quickdeck.ui.widgets.hover import _resolve  # noqa: E402
+check("hover._resolve 字符串直通", _resolve("fg") == "fg")
+check("hover._resolve 回调求值", _resolve(lambda: "card_bg") == "card_bg")
+
+_th = app.theme
+app.geometry("+-32000+-32000")  # 先挪离屏再显示，避免窗口闪现
+app.deiconify()
+app.update()
+_hf = app.folders[0]
+_old_lock = _hf.locked
+try:
+    _hf.set_locked(False)
+    app.update()
+    _hf.del_btn.event_generate("<Enter>")
+    app.update()
+    check("hover E2E: 解锁 Enter->红系 hover 底",
+          _hf.del_btn.cget("bg") == _th["danger_hover_bg"])
+    # 悬停中锁定：Leave 应恢复"当前锁定态"灰底而非语义色块（P13 回归点）
+    _hf.set_locked(True)
+    app.update()
+    _hf.del_btn.event_generate("<Leave>")
+    app.update()
+    check("hover E2E: 锁定后 Leave 仍灰底",
+          _hf.del_btn.cget("bg") == _th["header_bg"])
+    # disabled 守卫：禁用按钮 Enter 不做任何 hover 反馈
+    _hf.del_btn.event_generate("<Enter>")
+    app.update()
+    check("hover E2E: disabled Enter 无反馈",
+          _hf.del_btn.cget("bg") == _th["header_bg"])
+finally:
+    _hf.set_locked(_old_lock)
+    app.withdraw()
+    app.update()
 
 app.destroy()
 print("RESULT:", "PASS" if ok else "FAIL")
