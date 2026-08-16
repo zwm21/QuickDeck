@@ -763,6 +763,13 @@ class App(_TK_BASE):
         不再逐控件硬编码枚举（旧版三处枚举极易漏刷新增控件）。"""
         self.theme = theme
         self.tm.apply(theme)
+        # P12：注册表刷新会把锁定文件夹的删除按钮刷回常驻红底，
+        # 按 locked 重新压回灰底（见 FolderFrame.refresh_header_state）
+        for f in self.folders:
+            try:
+                f.refresh_header_state()
+            except Exception:
+                pass
         # P8b：旧配色的圆角底图整表失效，再逐卡按新主题重生成
         ui_images.invalidate()
         for c in self.every_card:

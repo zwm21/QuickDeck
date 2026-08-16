@@ -9,10 +9,14 @@
 def bind_hover(app, widget, normal_token, hover_token,
                also_fg=None):
     """给控件绑定 hover 底色切换。
-    also_fg=(normal_fg_token, hover_fg_token) 可同时切文字色。"""
+    also_fg=(normal_fg_token, hover_fg_token) 可同时切文字色。
+    disabled 控件不做任何 hover 反馈，避免"可点击"错觉；
+    其底色复位由状态所有者（如 FolderFrame.refresh_header_state）负责。"""
 
     def on_enter(_e):
         try:
+            if str(widget.cget("state")) == "disabled":
+                return
             kw = {"bg": app.theme[hover_token]}
             if also_fg:
                 kw["fg"] = app.theme[also_fg[1]]
@@ -22,6 +26,8 @@ def bind_hover(app, widget, normal_token, hover_token,
 
     def on_leave(_e):
         try:
+            if str(widget.cget("state")) == "disabled":
+                return
             kw = {"bg": app.theme[normal_token]}
             if also_fg:
                 kw["fg"] = app.theme[also_fg[0]]

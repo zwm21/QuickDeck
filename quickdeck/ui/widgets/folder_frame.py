@@ -9,6 +9,21 @@ from tkinter import font as tkFont
 
 from quickdeck.ui.layout import CARD_GAP, compute_cols, grid_signature
 
+# P12：header 图形字符统一走模块常量。HYWenHei 缺这些码位
+# （fontTools cmap 实测），靠系统字体逐字符回退渲染会导致各按钮
+# 大小/字重不一；▾/▸ 是 Unicode "small" 变体（16px 下墨迹仅 6×6），
+# 换全尺寸 ▼/▶ 后与 ✖ 同量级。
+ICON_DRAG = "\u2630"            # ☰ 拖拽把手
+ICON_LOCK_OPEN = "\U0001F513"   # 🔓 未锁
+ICON_LOCK_CLOSED = "\U0001F512"  # 🔒 已锁
+ICON_COLLAPSE_OPEN = "\u25BC"   # ▼ 展开中，点击收起
+ICON_COLLAPSE_CLOSED = "\u25B6"  # ▶ 已收起，点击展开
+ICON_DELETE = "\u2716"          # ✖ 删除
+
+# 图标按钮专用字体族：Segoe UI Symbol 覆盖上面全部码位（cmap 实测）。
+# 族不跟随用户字体（换任意字体族都不会丢字形），只字号跟随应用字号。
+ICON_FONT_FAMILY = "Segoe UI Symbol"
+
 
 class FolderFrame(tk.Frame):
     """一个文件夹 section：header（拖拽把手 + 名字 + 删除）+ 卡片 grid 容器。
@@ -37,10 +52,11 @@ class FolderFrame(tk.Frame):
         header.pack(fill="x")
         self.header = header
 
-        # 用小号字（约为 app 字体的 0.9 倍）让 header 更矮
-        self._header_font = tkFont.Font(
-            family=app.app_font.cget("family"),
-            size=max(8, int(app.app_font.cget("size")) - 1)
+        # P12：图标按钮/把手统一 ICON_FONT_FAMILY（见模块头注释），
+        # 字号取应用字号；header 高度由 name_entry（同字号加粗）决定
+        self._icon_font = tkFont.Font(
+            family=ICON_FONT_FAMILY,
+            size=max(8, int(app.app_font.cget("size")))
         )
         # P8 字号层级：文件夹名加粗（保持紧凑字号）
         self._name_font = tkFont.Font(
@@ -50,7 +66,7 @@ class FolderFrame(tk.Frame):
         )
 
         self.drag_handle = tk.Label(
-            header, text="\u2630", font=self._header_font,  # ☰
+            header, text=ICON_DRAG, font=self._icon_font,
             bg=th["header_bg"], fg=th["fg"], cursor="fleur", padx=2
         )
         self.drag_handle.pack(side="left")
@@ -67,36 +83,46 @@ class FolderFrame(tk.Frame):
         self.name_entry.bind("<FocusOut>", lambda e: self._on_rename())
         self.name_entry.bind("<Return>", lambda e: self._on_rename())
 
-        # 上锁按钮：🔓/🔒 切换；点击调 toggle_lock
+        # 上锁按钮：🔓/🔒 切换；点击调 toggle_lock。
+        # P12：浅金底色块 + 金色单字（emoji 经 GDI 单色渲染由 fg 染色），
+        # 锁定/未锁只靠字形区分，颜色恒定
         self.lock_btn = tk.Button(
-            header, text="\U0001F513",  # 🔓
-            font=self._header_font, relief="flat", bd=0,
-            bg=th["header_bg"], fg=th["header_fg"],
-            activebackground=th["header_active_bg"],
+            header, text=ICON_LOCK_OPEN,
+            font=self._icon_font, relief="flat", bd=0,
+            bg=th["lock_bg"], fg=th["lock_fg"],
+            activebackground=th["lock_bg_active"],
+            activeforeground=th["lock_fg"],
             padx=4, pady=0, cursor="hand2",
             command=self._on_toggle_lock
         )
         self.lock_btn.pack(side="right", padx=(0, 2))
 
-        # 折叠按钮：▾（展开中，点击收起）/ ▸（已收起，点击展开）；
+        # 折叠按钮：▼（展开中，点击收起）/ ▶（已收起，点击展开）；
         # 收起时隐藏整个卡片区（body），header 保留。与锁定相互独立。
+        # P12：浅蓝底色块 + accent 蓝字，hover 蓝→深蓝
         self.collapse_btn = tk.Button(
-            header, text="\u25BE",  # ▾
-            font=self._header_font, relief="flat", bd=0,
-            bg=th["header_bg"], fg=th["header_fg"],
-            activebackground=th["header_active_bg"],
-            padx=4, pady=0, cursor="hand2",
+            header, text=ICON_COLLAPSE_OPEN,
+            font=self._icon_font, relief="flat", bd=0,
+            bg=th["accent_bg"], fg=th["accent"],
+            activebackground=th["accent_bg_active"],
+            activeforeground=th["accent_hover"],
+            padx=6, pady=0, cursor="hand2",
             command=self._on_toggle_collapse
         )
         self.collapse_btn.pack(side="right", padx=(0, 2))
 
         # 用小号 ✕ 按钮替代原来的"删除文件夹"文本按钮，
-        # 让 header 高度显著变矮；保留同样的悬停危险色反馈
+        # 让 header 高度显著变矮
+        # P12：浅红底色块 + 常驻红字（对齐删除确认框的 danger 语义）；
+        # 锁定时 disabled——底色由 refresh_header_state 压回灰、
+        # 前景走 disabledforeground 弱化红
         self.del_btn = tk.Button(
-            header, text="\u2716",  # ✖
-            font=self._header_font, relief="flat", bd=0,
-            bg=th["header_bg"], fg=th["header_fg"],
+            header, text=ICON_DELETE,
+            font=self._icon_font, relief="flat", bd=0,
+            bg=th["danger_bg"], fg=th["danger_fg"],
             activebackground=th["danger_active_bg"],
+            activeforeground=th["danger_fg"],
+            disabledforeground=th["danger_fg_muted"],
             padx=4, pady=0, cursor="hand2",
             command=self._on_delete
         )
@@ -121,20 +147,25 @@ class FolderFrame(tk.Frame):
         tm.register(self.drag_handle, bg="header_bg", fg="fg")
         tm.register(self.name_entry, bg="header_bg", fg="fg",
                     insertbackground="fg", readonlybackground="header_bg")
-        tm.register(self.lock_btn, bg="header_bg", fg="header_fg",
-                    activebackground="header_active_bg")
-        tm.register(self.collapse_btn, bg="header_bg", fg="header_fg",
-                    activebackground="header_active_bg")
-        tm.register(self.del_btn, bg="header_bg", fg="header_fg",
-                    activebackground="danger_active_bg")
+        tm.register(self.lock_btn, bg="lock_bg", fg="lock_fg",
+                    activebackground="lock_bg_active",
+                    activeforeground="lock_fg")
+        tm.register(self.collapse_btn, bg="accent_bg", fg="accent",
+                    activebackground="accent_bg_active",
+                    activeforeground="accent_hover")
+        tm.register(self.del_btn, bg="danger_bg", fg="danger_fg",
+                    activebackground="danger_active_bg",
+                    activeforeground="danger_fg",
+                    disabledforeground="danger_fg_muted")
         tm.register(self.body, bg="folder_bg")
 
-        # P8 hover：header 图标按钮
+        # P12 hover：常驻色块 → 各自 hover 档；常态已是语义色，
+        # 删除按钮 hover 只切红底（不再从灰切红）
         from quickdeck.ui.widgets.hover import bind_hover
-        bind_hover(app, self.lock_btn, "header_bg", "header_active_bg")
-        bind_hover(app, self.collapse_btn, "header_bg", "header_active_bg")
-        bind_hover(app, self.del_btn, "header_bg", "danger_hover_bg",
-                   also_fg=("header_fg", "danger_fg"))
+        bind_hover(app, self.lock_btn, "lock_bg", "lock_bg_hover")
+        bind_hover(app, self.collapse_btn, "accent_bg", "accent_bg_hover",
+                   also_fg=("accent", "accent_hover"))
+        bind_hover(app, self.del_btn, "danger_bg", "danger_hover_bg")
 
     # ---- 数据转发（重构 P4：元数据唯一真源是 self.meta） ----
     @property
@@ -166,15 +197,14 @@ class FolderFrame(tk.Frame):
         self.meta.collapsed = bool(v)
 
     def refresh_header_font(self):
-        """app 字体变化时，让 header 内部小号字跟着刷新。"""
+        """app 字体变化时，让 header 内部字体跟着刷新。
+        图标字体族恒为 Segoe UI Symbol，只同步字号。"""
         try:
             self._name_font.configure(
                 family=self.app.app_font.cget("family"),
                 size=max(8, int(self.app.app_font.cget("size"))))
-            self._header_font.configure(
-                family=self.app.app_font.cget("family"),
-                size=max(8, int(self.app.app_font.cget("size")) - 1)
-            )
+            self._icon_font.configure(
+                size=max(8, int(self.app.app_font.cget("size"))))
         except Exception:
             pass
 
@@ -205,11 +235,23 @@ class FolderFrame(tk.Frame):
     def set_locked(self, locked):
         """切换本 folder 的锁定态，并把状态传播到 header + 所有卡片。"""
         self.locked = bool(locked)
-        # header 视觉：图标切换 + name_entry 禁用/启用 + 删除按钮禁用/启用
+        self.refresh_header_state()
+        # 传播到所有卡片
+        for c in self.cards:
+            try:
+                c.apply_lock_state(self.locked)
+            except Exception:
+                pass
+
+    def refresh_header_state(self):
+        """按 meta 同步 header 全部状态视觉：锁图标字形、名字可编辑性、
+        删除按钮可用性。启动恢复（set_locked）、运行时切换、主题切换
+        （App._apply_theme_body 钩子）三条路径共用——注册表刷新会把
+        禁用的删除按钮刷回常驻红底，这里按锁定态重新压回灰底。"""
+        th = self.app.theme
         try:
             self.lock_btn.configure(
-                text="\U0001F512" if self.locked else "\U0001F513"  # 🔒 / 🔓
-            )
+                text=ICON_LOCK_CLOSED if self.locked else ICON_LOCK_OPEN)
         except Exception:
             pass
         try:
@@ -221,16 +263,11 @@ class FolderFrame(tk.Frame):
             pass
         try:
             self.del_btn.configure(
-                state="disabled" if self.locked else "normal"
+                state="disabled" if self.locked else "normal",
+                bg=th["header_bg"] if self.locked else th["danger_bg"]
             )
         except Exception:
             pass
-        # 传播到所有卡片
-        for c in self.cards:
-            try:
-                c.apply_lock_state(self.locked)
-            except Exception:
-                pass
 
     def _on_toggle_collapse(self):
         self.set_collapsed(not self.collapsed)
@@ -241,7 +278,8 @@ class FolderFrame(tk.Frame):
         self.collapsed = bool(collapsed)
         try:
             self.collapse_btn.configure(
-                text="\u25B8" if self.collapsed else "\u25BE")  # ▸ / ▾
+                text=(ICON_COLLAPSE_CLOSED if self.collapsed
+                      else ICON_COLLAPSE_OPEN))  # ▶ / ▼
         except Exception:
             pass
         if self.collapsed:
