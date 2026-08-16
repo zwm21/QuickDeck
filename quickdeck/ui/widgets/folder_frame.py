@@ -52,11 +52,13 @@ class FolderFrame(tk.Frame):
         header.pack(fill="x")
         self.header = header
 
-        # P12：图标按钮/把手统一 ICON_FONT_FAMILY（见模块头注释），
-        # 字号取应用字号；header 高度由 name_entry（同字号加粗）决定
+        # P12：图标按钮/把手统一 ICON_FONT_FAMILY（见模块头注释）。
+        # P14：字号取应用字号-2——Segoe UI Symbol 行高比 HYWenHei 高
+        # 一档，-2 才能把按钮高度复原到 P12 前水平（chrome 非线性，
+        # 此值经全字号实测校准）；header 高度由 name_entry 决定
         self._icon_font = tkFont.Font(
             family=ICON_FONT_FAMILY,
-            size=max(8, int(app.app_font.cget("size")))
+            size=max(8, int(app.app_font.cget("size")) - 2)
         )
         # P8 字号层级：文件夹名加粗（保持紧凑字号）
         self._name_font = tkFont.Font(
@@ -85,48 +87,60 @@ class FolderFrame(tk.Frame):
 
         # 上锁按钮：🔓/🔒 切换；点击调 toggle_lock。
         # P12：浅金底色块 + 金色单字（emoji 经 GDI 单色渲染由 fg 染色），
-        # 锁定/未锁只靠字形区分，颜色恒定
+        # 锁定/未锁只靠字形区分，颜色恒定。
+        # P15：套正方形容器（见 _sync_square_buttons）
+        self.lock_holder = tk.Frame(header, bg=th["header_bg"])
+        self.lock_holder.pack(side="right", padx=(0, 2))
+        self.lock_holder.pack_propagate(False)
         self.lock_btn = tk.Button(
-            header, text=ICON_LOCK_OPEN,
+            self.lock_holder, text=ICON_LOCK_OPEN,
             font=self._icon_font, relief="flat", bd=0,
             bg=th["lock_bg"], fg=th["lock_fg"],
             activebackground=th["lock_bg_active"],
             activeforeground=th["lock_fg"],
-            padx=4, pady=0, cursor="hand2",
+            padx=0, pady=0, cursor="hand2",
             command=self._on_toggle_lock
         )
-        self.lock_btn.pack(side="right", padx=(0, 2))
+        self.lock_btn.pack(fill="both", expand=True)
 
         # 折叠按钮：▼（展开中，点击收起）/ ▶（已收起，点击展开）；
         # 收起时隐藏整个卡片区（body），header 保留。与锁定相互独立。
-        # P13：浅绿底色块 + 绿字；锁定态由 refresh_header_state 压平
+        # P13：浅绿底色块 + 绿字；锁定态由 refresh_header_state 压平。
+        # P15：套正方形容器（见 _sync_square_buttons）
+        self.collapse_holder = tk.Frame(header, bg=th["header_bg"])
+        self.collapse_holder.pack(side="right", padx=(0, 2))
+        self.collapse_holder.pack_propagate(False)
         self.collapse_btn = tk.Button(
-            header, text=ICON_COLLAPSE_OPEN,
+            self.collapse_holder, text=ICON_COLLAPSE_OPEN,
             font=self._icon_font, relief="flat", bd=0,
             bg=th["collapse_bg"], fg=th["collapse_fg"],
             activebackground=th["collapse_bg_active"],
             activeforeground=th["collapse_fg"],
-            padx=6, pady=0, cursor="hand2",
+            padx=0, pady=0, cursor="hand2",
             command=self._on_toggle_collapse
         )
-        self.collapse_btn.pack(side="right", padx=(0, 2))
+        self.collapse_btn.pack(fill="both", expand=True)
 
         # 用小号 ✕ 按钮替代原来的"删除文件夹"文本按钮，
         # 让 header 高度显著变矮
         # P12：浅红底色块 + 常驻红字（对齐删除确认框的 danger 语义）；
         # 锁定时 disabled——底色由 refresh_header_state 压回灰、
-        # 前景走 disabledforeground 弱化红
+        # 前景走 disabledforeground 弱化红。
+        # P15：套正方形容器（见 _sync_square_buttons）
+        self.del_holder = tk.Frame(header, bg=th["header_bg"])
+        self.del_holder.pack(side="right")
+        self.del_holder.pack_propagate(False)
         self.del_btn = tk.Button(
-            header, text=ICON_DELETE,
+            self.del_holder, text=ICON_DELETE,
             font=self._icon_font, relief="flat", bd=0,
             bg=th["danger_bg"], fg=th["danger_fg"],
             activebackground=th["danger_active_bg"],
             activeforeground=th["danger_fg"],
             disabledforeground=th["danger_fg_muted"],
-            padx=4, pady=0, cursor="hand2",
+            padx=0, pady=0, cursor="hand2",
             command=self._on_delete
         )
-        self.del_btn.pack(side="right")
+        self.del_btn.pack(fill="both", expand=True)
 
         # ---- body（卡片 grid 容器；padding 也收紧） ----
         self.body = tk.Frame(self, bg=th["folder_bg"], padx=4, pady=3)
@@ -147,6 +161,9 @@ class FolderFrame(tk.Frame):
         tm.register(self.drag_handle, bg="header_bg", fg="fg")
         tm.register(self.name_entry, bg="header_bg", fg="fg",
                     insertbackground="fg", readonlybackground="header_bg")
+        for holder in (self.lock_holder, self.collapse_holder,
+                       self.del_holder):
+            tm.register(holder, bg="header_bg")
         tm.register(self.lock_btn, bg="lock_bg", fg="lock_fg",
                     activebackground="lock_bg_active",
                     activeforeground="lock_fg")
@@ -175,6 +192,24 @@ class FolderFrame(tk.Frame):
                    lambda: "header_bg" if self.locked else "danger_bg",
                    lambda: ("header_active_bg" if self.locked
                             else "danger_hover_bg"))
+
+        # P15：按当前自然高度把三按钮容器设为正方形
+        self._sync_square_buttons()
+
+    def _sync_square_buttons(self):
+        """P15：三个图标按钮容器设为正方形。tk.Button 的 width 是
+        字符单位无法定像素，像素级正方形只能由固定尺寸容器 +
+        fill 填充实现。边长取按钮自然高度（字体驱动，字号/DPI
+        变化自动跟随）；防御：字形自然宽超自然高时取 max，
+        退化为非正方形也不裁字。"""
+        for holder, btn in ((self.lock_holder, self.lock_btn),
+                            (self.collapse_holder, self.collapse_btn),
+                            (self.del_holder, self.del_btn)):
+            try:
+                side = max(btn.winfo_reqheight(), btn.winfo_reqwidth())
+                holder.configure(width=side, height=side)
+            except Exception:
+                pass
 
     # ---- 数据转发（重构 P4：元数据唯一真源是 self.meta） ----
     @property
@@ -207,15 +242,16 @@ class FolderFrame(tk.Frame):
 
     def refresh_header_font(self):
         """app 字体变化时，让 header 内部字体跟着刷新。
-        图标字体族恒为 Segoe UI Symbol，只同步字号。"""
+        图标字体族恒为 Segoe UI Symbol，只同步字号（P14：N-2）。"""
         try:
             self._name_font.configure(
                 family=self.app.app_font.cget("family"),
                 size=max(8, int(self.app.app_font.cget("size"))))
             self._icon_font.configure(
-                size=max(8, int(self.app.app_font.cget("size"))))
+                size=max(8, int(self.app.app_font.cget("size")) - 2))
         except Exception:
             pass
+        self._sync_square_buttons()
 
     # ---- 事件 ----
     def _on_rename(self):
