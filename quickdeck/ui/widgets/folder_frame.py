@@ -99,13 +99,13 @@ class FolderFrame(tk.Frame):
 
         # 折叠按钮：▼（展开中，点击收起）/ ▶（已收起，点击展开）；
         # 收起时隐藏整个卡片区（body），header 保留。与锁定相互独立。
-        # P12：浅蓝底色块 + accent 蓝字，hover 蓝→深蓝
+        # P13：浅绿底色块 + 绿字；锁定态由 refresh_header_state 压平
         self.collapse_btn = tk.Button(
             header, text=ICON_COLLAPSE_OPEN,
             font=self._icon_font, relief="flat", bd=0,
-            bg=th["accent_bg"], fg=th["accent"],
-            activebackground=th["accent_bg_active"],
-            activeforeground=th["accent_hover"],
+            bg=th["collapse_bg"], fg=th["collapse_fg"],
+            activebackground=th["collapse_bg_active"],
+            activeforeground=th["collapse_fg"],
             padx=6, pady=0, cursor="hand2",
             command=self._on_toggle_collapse
         )
@@ -150,22 +150,31 @@ class FolderFrame(tk.Frame):
         tm.register(self.lock_btn, bg="lock_bg", fg="lock_fg",
                     activebackground="lock_bg_active",
                     activeforeground="lock_fg")
-        tm.register(self.collapse_btn, bg="accent_bg", fg="accent",
-                    activebackground="accent_bg_active",
-                    activeforeground="accent_hover")
+        tm.register(self.collapse_btn, bg="collapse_bg", fg="collapse_fg",
+                    activebackground="collapse_bg_active",
+                    activeforeground="collapse_fg")
         tm.register(self.del_btn, bg="danger_bg", fg="danger_fg",
                     activebackground="danger_active_bg",
                     activeforeground="danger_fg",
                     disabledforeground="danger_fg_muted")
         tm.register(self.body, bg="folder_bg")
 
-        # P12 hover：常驻色块 → 各自 hover 档；常态已是语义色，
-        # 删除按钮 hover 只切红底（不再从灰切红）
+        # P13 hover：正常/悬停 token 按锁定态动态解析——未锁定走语义
+        # 色块各档，锁定态压平为中性灰（hover 仍有反馈，提示可交互）；
+        # Leave 恢复的是"当前锁定态"的底色，不会把色块刷回来
         from quickdeck.ui.widgets.hover import bind_hover
-        bind_hover(app, self.lock_btn, "lock_bg", "lock_bg_hover")
-        bind_hover(app, self.collapse_btn, "accent_bg", "accent_bg_hover",
-                   also_fg=("accent", "accent_hover"))
-        bind_hover(app, self.del_btn, "danger_bg", "danger_hover_bg")
+        bind_hover(app, self.lock_btn,
+                   lambda: "header_bg" if self.locked else "lock_bg",
+                   lambda: ("header_active_bg" if self.locked
+                            else "lock_bg_hover"))
+        bind_hover(app, self.collapse_btn,
+                   lambda: "header_bg" if self.locked else "collapse_bg",
+                   lambda: ("header_active_bg" if self.locked
+                            else "collapse_bg_hover"))
+        bind_hover(app, self.del_btn,
+                   lambda: "header_bg" if self.locked else "danger_bg",
+                   lambda: ("header_active_bg" if self.locked
+                            else "danger_hover_bg"))
 
     # ---- 数据转发（重构 P4：元数据唯一真源是 self.meta） ----
     @property
@@ -244,27 +253,44 @@ class FolderFrame(tk.Frame):
                 pass
 
     def refresh_header_state(self):
-        """按 meta 同步 header 全部状态视觉：锁图标字形、名字可编辑性、
-        删除按钮可用性。启动恢复（set_locked）、运行时切换、主题切换
-        （App._apply_theme_body 钩子）三条路径共用——注册表刷新会把
-        禁用的删除按钮刷回常驻红底，这里按锁定态重新压回灰底。"""
+        """按 meta 同步 header 全部状态视觉（P13 起含三按钮底色）：
+        未锁定——三按钮常驻语义色块（删除红/折叠绿/锁定金）+ 各自
+        active 档；锁定——全部压平 header 灰底（active 档退中性，
+        折叠 fg 退次级灰），仅保留字形色彩（金🔒 / 灰▼ / 弱红✖）。
+        启动恢复（set_locked）、运行时切换、主题切换（App.
+        _apply_theme_body 钩子）三条路径共用——注册表刷新会把按钮
+        刷回语义色块，这里按锁定态重新压平。"""
         th = self.app.theme
+        flat = self.locked
         try:
             self.lock_btn.configure(
-                text=ICON_LOCK_CLOSED if self.locked else ICON_LOCK_OPEN)
+                text=ICON_LOCK_CLOSED if flat else ICON_LOCK_OPEN,
+                bg=th["header_bg"] if flat else th["lock_bg"],
+                activebackground=(th["header_active_bg"] if flat
+                                  else th["lock_bg_active"]))
         except Exception:
             pass
         try:
             # 用 readonly 保留文字可见与选取，但不允许键入
             self.name_entry.configure(
-                state="readonly" if self.locked else "normal"
+                state="readonly" if flat else "normal"
             )
         except Exception:
             pass
         try:
+            self.collapse_btn.configure(
+                bg=th["header_bg"] if flat else th["collapse_bg"],
+                fg=th["fg_secondary"] if flat else th["collapse_fg"],
+                activebackground=(th["header_active_bg"] if flat
+                                  else th["collapse_bg_active"]),
+                activeforeground=(th["fg_secondary"] if flat
+                                  else th["collapse_fg"]))
+        except Exception:
+            pass
+        try:
             self.del_btn.configure(
-                state="disabled" if self.locked else "normal",
-                bg=th["header_bg"] if self.locked else th["danger_bg"]
+                state="disabled" if flat else "normal",
+                bg=th["header_bg"] if flat else th["danger_bg"]
             )
         except Exception:
             pass
